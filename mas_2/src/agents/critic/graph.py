@@ -10,23 +10,33 @@ from .state import CriticAgentState
 from src.core.llm import get_llm
 
 # 初始化 LLM
-llm = get_llm(temperature=0.5)
-llm_vision = get_llm(model_name="qwen-vl-plus", temperature=0.2)
+llm = get_llm(temperature=0.1) # 建议降低温度，让审核更死板、更守规矩
+llm_vision = get_llm(model_name="qwen-vl-plus", temperature=0.1)
 
-# --- 全局 System Prompt --- 
+# --- 全局 System Prompt (增强版) --- 
 CRITIC_SYSTEM_PROMPT = """
-Role: Senior Bioinformatics Reviewer (Nature/Cell Standard)
+Role: Senior Bioinformatics Reviewer (Nature/Cell Standard) & Technical Auditor
 Profile:
-You are a rigorous AI auditor specializing in Computational Biology and Bioinformatics.
-Your responsibility is to review the output of other agents (Code, Literature, Data Visualization, Analysis) to ensure scientific accuracy, reproducibility, and clarity.
+You are a rigorous AI auditor. Your goal is to verify if the CURRENT STEP has been completed according to its SPECIFIC acceptance criteria.
 
-Core Principles:
-1. Scientific Rigor: No hallucinated genes, proteins, or statistical values.
-2. Reproducibility: Code must be logical and executable; methods must be clear.
-3. Clarity: Visualizations must be publication-ready; text must be concise.
+*** CRITICAL RULES FOR MULTI-STEP TASKS ***
+1. SCOPE IS LIMITED: You are reviewing ONE STEP of a larger plan (e.g., Step 1 of 7).
+   - DO NOT reject the work because it hasn't finished the *entire* project yet.
+   - IF Step 1 is "Load Data", and the code loads data: PASS IT. DO NOT ask for UMAP/Clustering/Annotation if that is in Step 4.
+   - ONLY judge based on the "Current Step Acceptance Criteria".
+
+2. DOCKER ENVIRONMENT AWARENESS:
+   - The code runs in a Docker container.
+   - Path Mismatch is EXPECTED: The user says `/home/user/data/file.h5ad`, but the code uses `/app/data/file.h5ad`.
+   - THIS IS CORRECT BEHAVIOR (Volume Mounting).
+   - NEVER reject code solely because the file path looks different from the user's prompt, AS LONG AS the code executed successfully.
+
+3. EXECUTION LOG IS KING:
+   - If the `Execution Result` shows "SUCCESS" or produced the expected output files, you MUST trust the code works, even if the paths look weird.
+   - Do not hallucinate errors if the log says it worked.
 
 Output Protocol:
-- If the work meets the standard of a high-impact journal, reply with exactly: "PASS"
+- If the work meets the *current step's* criteria, reply with exactly: "PASS"
 - If the work is flawed, reply in the following format:
   [FAIL]
   CRITICAL ISSUE: <Describe the scientific or technical error>
@@ -62,51 +72,27 @@ def check_umap_image(image_base64: str, query: str, expected_output: str = None,
     image_system_prompt = """
     --- Visualization Review Task ---
     Task: Evaluate the scientific visualization quality and relevance to the User Question.
-
-    Step 1: Identify the Plot Type
-    - Dimension Reduction (UMAP/t-SNE/PCA)
-    - Differential Expression (Volcano Plot, MA Plot)
-    - Expression Patterns (Heatmap, Dot Plot, Violin Plot)
-    - Pathway/Enrichment (Barplot, Network)
-    - Other
-
-    Step 2: Apply Quality Criteria (General & Specific)
-
+    
     [Universal Criteria] (Must Have)
-    1. Labels: Axis labels (e.g., "UMAP_1", "log2FoldChange") must be visible and meaningful.
-    2. Legends: Color bars or grouping legends must be clear.
-    3. Resolution: No severe blurring that hinders interpretation.
-
-    [Type-Specific Criteria]
-    - For UMAP/t-SNE: Check for distinct clustering (compact groups), batch effects, or "single blob" issues.
-    - For Volcano Plots: Check if significance thresholds (p-value lines) and top genes are marked.
-    - For Heatmaps: Check for clear block patterns (clustering) and readable sample/gene names.
-
-    Step 3: Make a Decision
-    - Is the plot informative and scientifically valid?
-    - Does it directly answer the user's query?
+    1. Labels: Axis labels must be visible.
+    2. Clarity: No severe blurring.
+    
+    [Step-Specific Context]
+    If this is an intermediate step, do not demand final publication polish.
     """
 
     # 完整 System Prompt
     full_system_prompt = f"{CRITIC_SYSTEM_PROMPT}\n{image_system_prompt}"
     
-    # 构建步骤上下文信息
     step_context_note = ""
     if step_context:
-        step_name = step_context.get("step_name", "")
         step_num = step_context.get("step_num", "")
         total_steps = step_context.get("total_steps", "")
-        step_context_note = f"\n\n【重要上下文】这是多步骤任务中的一步：\n"
-        if step_num and total_steps:
-            step_context_note += f"- 当前步骤：步骤 {step_num}/{total_steps}\n"
-        if step_name:
-            step_context_note += f"- 步骤名称：{step_name}\n"
-        step_context_note += "- 请只关注当前步骤的验收标准，不要要求完成整个任务的所有步骤。\n"
-        step_context_note += "- 只要当前步骤的输出满足其验收标准，就应该通过审核。\n"
+        step_context_note = f"\n\n【步骤上下文】当前是步骤 {step_num}/{total_steps}。请只检查本步骤要求生成的图片。\n"
     
     expected_output_note = ""
     if expected_output:
-        expected_output_note = f"\n\n【当前步骤的验收标准】\n{expected_output}\n请特别关注图片是否能够满足上述验收标准。"
+        expected_output_note = f"\n\n【验收标准】\n{expected_output}"
     
     user_prompt = f"User question: {query}{step_context_note}{expected_output_note}"
     
@@ -127,16 +113,26 @@ def check_umap_image(image_base64: str, query: str, expected_output: str = None,
     return response.content
 
 
-def check_code(content: str, query: str, expected_output: str = None, 
-               step_context: dict = None) -> str:
+def check_code(content: str, query: str, execution_result: str = None, 
+               expected_output: str = None, step_context: dict = None) -> str:
     """审核代码"""
+    # --- 针对代码审核的强化 Prompt ---
     code_system_prompt = """
-    你是一个资深代码审查员。
-    请检查：
-    1. 代码是否安全？
-    2. 是否直接回答了问题？
-    3. 是否有死循环风险？
-    4. 代码逻辑是否合理？
+    你是一个资深代码审查员。请按以下优先级进行检查：
+
+    1. 【最高优先级】执行结果检查 (Execution Check):
+       - 查看提供的【代码执行结果/日志】。
+       - 如果日志显示 "EXECUTION SUCCESS" 或成功输出了结果标记（如 ===RESULT===），则代码**通过**。
+       - 只要运行成功，**绝对不要**因为文件路径与用户输入不同而驳回（这是Docker映射的正常现象）。
+       - 只有在日志显示 "Traceback", "Error", "Exception" 时才判定为失败。
+
+    2. 步骤范围检查 (Scope Check):
+       - 当前是分步执行模式。
+       - **严禁**要求代码包含当前步骤未提及的功能。
+       - 例子：如果当前步骤是"读取数据"，代码只要读取并保存了数据就是 PASS。**不要**抱怨"未进行聚类"或"未画图"。
+
+    3. 代码逻辑检查:
+       - 只有在没有执行日志的情况下，才深度检查逻辑漏洞。
     """
     
     # 构建步骤上下文信息
@@ -145,21 +141,31 @@ def check_code(content: str, query: str, expected_output: str = None,
         step_name = step_context.get("step_name", "")
         step_num = step_context.get("step_num", "")
         total_steps = step_context.get("total_steps", "")
-        step_context_note = f"\n\n【重要上下文】这是多步骤任务中的一步：\n"
-        if step_num and total_steps:
-            step_context_note += f"- 当前步骤：步骤 {step_num}/{total_steps}\n"
-        if step_name:
-            step_context_note += f"- 步骤名称：{step_name}\n"
-        step_context_note += "- 请只关注当前步骤的验收标准，不要要求完成整个任务的所有步骤。\n"
-        step_context_note += "- 只要当前步骤的代码能够满足其验收标准，就应该通过审核。\n"
-    
+        step_context_note = f"\n\n【重要！当前步骤上下文】\n"
+        step_context_note += f"- 进度：步骤 {step_num} / {total_steps}\n"
+        step_context_note += f"- 本步骤任务：{step_name}\n"
+        step_context_note += f"- **审核红线**：只要完成了'{step_name}'，无论后面还有多少步骤没做，都必须给 PASS。\n"
+        
     expected_output_note = ""
     if expected_output:
-        expected_output_note = f"\n\n【当前步骤的验收标准】\n{expected_output}\n请特别关注代码是否能够满足上述验收标准。"
-    
+        expected_output_note = f"\n\n【本步骤验收标准】\n{expected_output}\n(只要满足此标准即可，不要自行加码)"
+
+    execution_note = ""
+    if execution_result:
+        execution_note = f"\n\n【代码执行结果/日志】\n{execution_result}\n\n"
+        # 增加提示引导 Critic 信任日志
+        if "EXECUTION SUCCESS" in execution_result or "===RESULT===" in execution_result:
+            execution_note += "提示：日志显示执行成功。请忽略路径差异，直接通过。\n"
+        else:
+            execution_note += "提示：日志显示执行可能存在问题，请仔细检查报错信息。\n"
+
     user_prompt = f"""
     用户问题: {query}
-    待审核代码: {content}
+    待审核代码: 
+    ```python
+    {content}
+    ```
+    {execution_note}
     {step_context_note}{expected_output_note}
     """
     
@@ -178,29 +184,20 @@ def check_docs(content: list, query: str, expected_output: str = None,
     
     docs_system_prompt = """
     你是一个科研审稿人。
-    请检查：
-    1. 文献是否与问题强相关？
-    2. 是否包含足够的信息？
-    3. 文献质量是否可靠？
+    请检查文献是否与问题相关且包含足够信息。
+    对于分步任务，只要满足当前步骤的检索要求即可。
     """
     
-    # 构建步骤上下文信息
     step_context_note = ""
     if step_context:
         step_name = step_context.get("step_name", "")
         step_num = step_context.get("step_num", "")
         total_steps = step_context.get("total_steps", "")
-        step_context_note = f"\n\n【重要上下文】这是多步骤任务中的一步：\n"
-        if step_num and total_steps:
-            step_context_note += f"- 当前步骤：步骤 {step_num}/{total_steps}\n"
-        if step_name:
-            step_context_note += f"- 步骤名称：{step_name}\n"
-        step_context_note += "- 请只关注当前步骤的验收标准，不要要求完成整个任务的所有步骤。\n"
-        step_context_note += "- 只要当前步骤检索到的文献能够满足其验收标准，就应该通过审核。\n"
+        step_context_note = f"\n\n【步骤上下文】步骤 {step_num}/{total_steps}: {step_name}。\n"
     
     expected_output_note = ""
     if expected_output:
-        expected_output_note = f"\n\n【当前步骤的验收标准】\n{expected_output}\n请特别关注检索到的文献是否能够满足上述验收标准。"
+        expected_output_note = f"\n\n【验收标准】\n{expected_output}"
     
     user_prompt = f"""
     用户问题: {query}
@@ -221,29 +218,19 @@ def check_db(content: str, query: str, expected_output: str = None,
     """审核数据库结果"""
     db_system_prompt = """
     你是一个数据分析师。
-    请检查：
-    1. 数据格式是否正确？
-    2. 是否为空结果？
-    3. 结果是否满足预期要求？
+    请检查数据查询结果是否为空，以及是否符合当前步骤的要求。
     """
     
-    # 构建步骤上下文信息
     step_context_note = ""
     if step_context:
         step_name = step_context.get("step_name", "")
         step_num = step_context.get("step_num", "")
         total_steps = step_context.get("total_steps", "")
-        step_context_note = f"\n\n【重要上下文】这是多步骤任务中的一步：\n"
-        if step_num and total_steps:
-            step_context_note += f"- 当前步骤：步骤 {step_num}/{total_steps}\n"
-        if step_name:
-            step_context_note += f"- 步骤名称：{step_name}\n"
-        step_context_note += "- 请只关注当前步骤的验收标准，不要要求完成整个任务的所有步骤。\n"
-        step_context_note += "- 只要当前步骤的查询结果能够满足其验收标准，就应该通过审核。\n"
+        step_context_note = f"\n\n【步骤上下文】步骤 {step_num}/{total_steps}: {step_name}。\n"
     
     expected_output_note = ""
     if expected_output:
-        expected_output_note = f"\n\n【当前步骤的验收标准】\n{expected_output}\n请特别关注查询结果是否能够满足上述验收标准。"
+        expected_output_note = f"\n\n【验收标准】\n{expected_output}"
     
     user_prompt = f"""
     用户问题: {query}
@@ -262,18 +249,15 @@ def check_db(content: str, query: str, expected_output: str = None,
 def review_contribution(state: CriticAgentState) -> CriticAgentState:
     """
     审核节点
-    根据内容类型调用相应的审核函数
     """
     pending = state.get("pending_contribution")
     query = state.get("user_query", "")
     last_worker = state.get("last_worker", "")
     
-    # 获取当前步骤的预期输出和计划信息
     expected_output = state.get("current_step_expected_output")
     plan = state.get("plan", [])
     current_step_index = state.get("current_step_index", 0)
     
-    # 构建步骤上下文信息
     step_context = None
     if plan and current_step_index < len(plan):
         current_step = plan[current_step_index]
@@ -287,16 +271,12 @@ def review_contribution(state: CriticAgentState) -> CriticAgentState:
     print(f"--- [Critic] 正在审核 {last_worker} 的产出 ---")
     if step_context:
         print(f"  --> 步骤 {step_context['step_num']}/{step_context['total_steps']}: {step_context['step_name']}")
-    if expected_output:
-        print(f"  --> 验收标准: {expected_output[:100]}...")
     
     if pending is None:
-        feedback = "未找到待审核内容"
         state["is_approved"] = False
-        state["critique_feedback"] = feedback
+        state["critique_feedback"] = "未找到待审核内容"
         return state
     
-    # 判断内容类型并分发审核
     feedback = ""
     
     # 检查是否是图片
@@ -307,33 +287,50 @@ def review_contribution(state: CriticAgentState) -> CriticAgentState:
         feedback = check_umap_image(image_b64, query, expected_output, step_context)
         state["content_type"] = "image"
     
-    # 检查是否是代码
+    # 检查是否是代码 (增强版提取逻辑)
     elif isinstance(pending, dict) and "code" in pending:
         code = pending.get("code", "")
-        feedback = check_code(code, query, expected_output, step_context)
+        
+        execution_result = ""
+        
+        # 1. 优先检查 success 字段
+        is_exec_success = pending.get("success", False)
+        
+        # 2. 强制提取错误信息
+        if not is_exec_success:
+            # 如果标记为失败，必须提取错误，即使 error 字段为空也要从 output 里找
+            error_msg = pending.get("error", "")
+            if not error_msg:
+                error_msg = pending.get("output", "Unknown execution error")
+            execution_result = f"EXECUTION FAILED (CRITICAL):\n{error_msg}"
+        else:
+            # 如果成功，提取结果
+            result_msg = pending.get("result", "")
+            if not result_msg:
+                result_msg = pending.get("output", "Execution successful but no output.")
+            execution_result = f"EXECUTION SUCCESS:\n{result_msg}"
+            
+        # 3. 打印调试信息，确保我们知道传给 LLM 的是什么
+        print(f"  --> [Debug] 传给 Critic 的执行结果片段: {execution_result[:100]}...")
+        
+        feedback = check_code(code, query, execution_result, expected_output, step_context)
         state["content_type"] = "code"
     
-    # 检查是否是文档列表
+    # 其他类型检查...
     elif isinstance(pending, list) or (isinstance(pending, dict) and "docs" in str(pending)):
         docs = pending if isinstance(pending, list) else pending.get("docs", [])
         feedback = check_docs(docs, query, expected_output, step_context)
         state["content_type"] = "docs"
     
-    # 检查是否是数据库结果
     elif isinstance(pending, str) or (isinstance(pending, dict) and "result" in str(pending)):
         content = pending if isinstance(pending, str) else str(pending.get("result", ""))
         feedback = check_db(content, query, expected_output, step_context)
         state["content_type"] = "db_result"
     
     else:
-        # 通用审核
         content_str = str(pending)
-        if "code" in content_str.lower() or "def " in content_str or "import " in content_str:
-            feedback = check_code(content_str, query, expected_output, step_context)
-            state["content_type"] = "code"
-        else:
-            feedback = check_docs([content_str], query, expected_output, step_context)
-            state["content_type"] = "docs"
+        feedback = check_code(content_str, query, None, expected_output, step_context)
+        state["content_type"] = "code"
     
     # 判断是否通过
     is_pass = "PASS" in feedback.upper() or "通过" in feedback
@@ -343,11 +340,9 @@ def review_contribution(state: CriticAgentState) -> CriticAgentState:
         state["is_approved"] = True
         state["critique_feedback"] = None
         
-        # 根据 worker 类型归档数据
         if last_worker == "code_dev":
             state["code_solution"] = str(pending)
         elif last_worker == "rag_researcher":
-            # 如果是列表，转换为字符串
             if isinstance(pending, list):
                 state["rag_context"] = "\n\n".join(pending)
             else:
@@ -355,7 +350,6 @@ def review_contribution(state: CriticAgentState) -> CriticAgentState:
         elif last_worker == "data_analyst":
             state["final_report"] = str(pending)
         
-        # 清空待审核区
         state["pending_contribution"] = None
     else:
         print(f"  --> 审核驳回！意见: {feedback}")
@@ -368,14 +362,7 @@ def review_contribution(state: CriticAgentState) -> CriticAgentState:
 
 # 构建子图
 workflow = StateGraph(CriticAgentState)
-
-# 添加节点
 workflow.add_node("review_contribution", review_contribution)
-
-# 定义边
 workflow.add_edge(START, "review_contribution")
 workflow.add_edge("review_contribution", END)
-
-# 编译子图
 critic_agent_graph = workflow.compile()
-

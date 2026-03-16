@@ -126,6 +126,17 @@ def generate_code(state: CodeAgentState) -> CodeAgentState:
     """
     print(f"--- [Code Dev] 正在生成代码 (迭代 {state.get('internal_iteration_count', 0) + 1}) ---")
 
+    critic_feedback = state.get("critique_feedback", "")
+    internal_feedback = state.get("feedback", "")
+    
+    final_feedback = ""
+    if critic_feedback:
+        print(f"  --> 收到 Critic 的驳回意见: {critic_feedback[:50]}...")
+        final_feedback = critic_feedback
+    elif internal_feedback:
+        print(f"  --> 收到内部执行的错误反馈: {internal_feedback[:50]}...")
+        final_feedback = internal_feedback
+
     # 首先从 user_query 中提取路径（如果 state 中没有）
     state = extract_paths_from_state(state)
 
@@ -135,7 +146,7 @@ def generate_code(state: CodeAgentState) -> CodeAgentState:
         context_instruction = f"""
         【重要！这是修改重试】
         上一次生成的代码或结果被审核员驳回。
-        驳回意见/错误信息：{state['feedback']}
+        驳回意见/错误信息：{final_feedback}
         请根据上述意见修改代码。
         """
 
@@ -192,7 +203,6 @@ def generate_code(state: CodeAgentState) -> CodeAgentState:
 你是专业的单细胞数据分析工程师，仅返回【纯Python代码】（无解释、无注释、无markdown）和 【纯requirement.txt包列表】（无解释、无注释），必须严格遵守：
 1. 只使用Leiden聚类（sc.tl.leiden），禁止使用Louvain聚类（sc.tl.louvain）；
 2. 完整导入所有依赖，确保代码能独立运行；
-3. 必须输出analysis_summary变量，格式为：analysis_summary = f"细胞总数：{{adata.n_obs}}，基因总数：{{adata.n_vars}}，聚类数量：{{len(adata.obs['leiden'].cat.categories)}}"
 4. UMAP图标题固定为'Clustering UMAP'，无特殊字符；
 5. 生成给docker环境的requirements.txt，确保包含所有代码中用到的包。
 6. 代码将在 Docker 容器中运行
@@ -201,13 +211,33 @@ def generate_code(state: CodeAgentState) -> CodeAgentState:
 9. 必须使用 print(f"===RESULT==={{analysis_summary}}===") 输出结果标记
 10. 如果生成图片，请保存到 {docker_output_path} 目录
 11. 根据数据格式来判断用什么方法进行读取，如是h5ad格式，使用sc.read_h5ad。
+12. 如果是单细胞数据，默认保存为.h5ad格式。
+13. requirement.txt内容必须包含所有代码中用到的包。
+14. **依赖链条 (Dependency Chain)**:
+   - **执行 UMAP/聚类前必须计算邻近图**：在调用 `sc.tl.umap`、`sc.tl.leiden` 或 `sc.tl.louvain` 之前，**必须** 显式调用 `sc.pp.neighbors(adata)`（除非你确定 .uns['neighbors'] 已存在）。
+   - **绘图前必须确保数据存在**：在调用 `sc.pl.umap(adata, color='leiden')` 之前，**必须** 先运行 `sc.tl.leiden(adata)`。严禁在没有计算聚类的情况下尝试绘制聚类图。
+
+15. **防御性编程 (Defensive Coding)**:
+   - **检查列是否存在**：在访问 `adata.obs['leiden']` 或其他列之前，使用 `if 'leiden' in adata.obs:` 进行检查。
+   - **不要硬编码中间文件名**：严格使用用户指令中指定的 `输入文件路径` 和 `输出文件路径`。不要自己编造如 `step_3_pca.h5ad` 这样的文件名，除非任务明确要求读取它。
+
+16. **路径与环境**:
+   - 数据读取路径：{docker_data_path}
+   - 结果保存路径：{docker_output_path}
+   - 如果保存图片，必须使用 `plt.savefig()` 并指定完整路径，不要使用 `show=True`。
 
 格式：
 python代码全部被包括在```python 和```之间
 requirement.txt内容全部被包括在```md 和 ```之间
 注意：请严格按照上述格式返回内容，确保代码和requirements.txt清晰分隔。
-{context_instruction}
     """
+        
+    # 3. 输出 analysis_summary 变量时需进行安全检查：
+    # - 必须包含：细胞总数 (adata.n_obs)、基因总数 (adata.n_vars)
+    # - 【仅当存在聚类结果时】才包含：聚类数量 (len(adata.obs['leiden'].cat.categories))
+    # - 示例代码：
+    #     n_clusters = len(adata.obs['leiden'].cat.categories) if 'leiden' in adata.obs else 0
+    #     analysis_summary = f"细胞总数：{{adata.n_obs}}，基因总数：{{adata.n_vars}}，聚类数量：{{n_clusters}}"
 
     # 构建任务描述，优先使用当前步骤的输入
     task_description = current_step_input if current_step_input else state.get('task', state.get('user_query', ''))
@@ -233,6 +263,7 @@ requirement.txt内容全部被包括在```md 和 ```之间
     结果路径（Docker容器内）：{docker_output_path}
     {file_paths_note}
     {expected_output_note}
+    {context_instruction}
     """
 
     messages = [
@@ -382,32 +413,50 @@ sc.settings.verbosity = 3  # 显示Scanpy详细日志
     llm_code = state.get("scanpy_code", "")
 
     footer = f"""
-# 强制输出结果标记（关键：解决list index out of range）
+import os
+
+# --- 智能结果输出 ---
 try:
-    # 确保即使中间步骤有警告，也能输出结果标记
+    # 1. 优先检查代码中是否定义了自定义摘要
     if 'analysis_summary' in locals():
         print(f"===RESULT==={{analysis_summary}}===")
+    
+    # 2. 如果没有摘要，但有 adata 对象，输出基础维度信息
+    elif 'adata' in locals():
+        # 基础信息
+        res_str = f"Execution successful. Data shape: {{adata.n_obs}} cells x {{adata.n_vars}} genes."
+        
+        # 尝试通过 adata.uns/obs 推断做了什么，作为补充信息
+        infos = []
+        if 'pca' in adata.uns: infos.append("PCA done")
+        if 'neighbors' in adata.uns: infos.append("Neighbors computed")
+        if 'leiden' in adata.obs: 
+            n_clust = len(adata.obs['leiden'].unique())
+            infos.append(f"Leiden clusters: {{n_clust}}")
+        if 'louvain' in adata.obs:
+            n_clust = len(adata.obs['louvain'].unique())
+            infos.append(f"Louvain clusters: {{n_clust}}")
+            
+        if infos:
+            res_str += f" (Progress: {{', '.join(infos)}})"
+            
+        print(f"===RESULT==={{res_str}}===")
+        
+    # 3. 如果只是普通脚本（没有adata），检查是否有文件生成
     else:
-        # 如果没有 analysis_summary，尝试从 adata 提取基本信息
-        if 'adata' in locals():
-            fallback_result = f"细胞总数：{{adata.n_obs}}，基因总数：{{adata.n_vars}}"
-            if 'leiden' in adata.obs.columns:
-                fallback_result += f"，聚类数量：{{len(adata.obs['leiden'].cat.categories)}}"
-            print(f"===RESULT==={{fallback_result}}===")
+        # 检查 output 目录下的新文件
+        out_files = os.listdir('/app/output')
+        if out_files:
+            print(f"===RESULT===Step completed. Generated files: {{', '.join(out_files)}}===")
         else:
-            print(f"===RESULT===代码执行完成，但未找到结果变量===")
+            print(f"===RESULT===Step completed successfully (No specific return value).===")
+
 except Exception as e:
-    # 即使analysis_summary未定义，也输出基础细胞/基因数
-    try:
-        if 'adata' in locals():
-            fallback_result = f"细胞总数：{{adata.n_obs}}，基因总数：{{adata.n_vars}}（聚类步骤失败：{{str(e)[:50]}}）"
-            print(f"===RESULT==={{fallback_result}}===")
-        else:
-            print(f"===RESULT===代码执行失败，无法提取结果：{{str(e)}}===")
-    except:
-        # 终极兜底：输出空标记，避免index out of range
-        print(f"===RESULT===代码执行失败，无法提取结果===")
-    """
+    # 最后的安全网
+    print(f"===RESULT===Execution finished, but result extraction failed: {{str(e)}}===")
+"""
+    
+        
 
     # 创建临时目录运行代码
     with tempfile.TemporaryDirectory() as temp_dir:

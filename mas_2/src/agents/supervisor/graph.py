@@ -265,7 +265,7 @@ def _make_dynamic_decision(state: SupervisorAgentState, user_query: str, rag_con
 5. FINISH: 任务完成
 
 决策原则：
-- 如果有必须要搜索的内容，调用 rag_researcher
+- 只有当必须要搜索的内容，才调用 rag_researcher；默认不调用
 - 如果有待审核内容，必须调用 critic
 - 如果需要生成代码，调用 code_dev
 - 如果需要调用现有工具，调用 tool_caller

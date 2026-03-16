@@ -11,4 +11,5 @@ gseapy
 pandas
 pytest
 pytest-mock
+chainlit
 

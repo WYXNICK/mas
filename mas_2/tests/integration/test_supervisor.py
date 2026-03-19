@@ -20,7 +20,7 @@ def test_supervisor_decision_for_code_task(supervisor_state):
     # 断言：next_worker 字段已更新
     assert "next_worker" in result, "结果中应包含 next_worker 字段"
     assert result.get("next_worker") in [
-        "rag_researcher", "code_dev", "data_analyst", "critic", "FINISH"
+        "rag_researcher", "code_dev", "tool_caller", "critic", "FINISH"
     ], f"next_worker 应该是有效的 worker 名称，实际为: {result.get('next_worker')}"
     
     # 对于代码生成任务，应该选择 code_dev
@@ -41,7 +41,7 @@ def test_supervisor_decision_for_research_task(supervisor_state):
     # 断言：应该选择 rag_researcher（但 LLM 可能选择其他，所以只验证有效值）
     assert result.get("next_worker") is not None
     assert result.get("next_worker") in [
-        "rag_researcher", "code_dev", "data_analyst", "critic", "FINISH"
+        "rag_researcher", "code_dev", "tool_caller", "critic", "FINISH"
     ]
 
 

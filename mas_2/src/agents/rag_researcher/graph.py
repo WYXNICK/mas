@@ -3,6 +3,7 @@ RAG Researcher Agent 子图
 负责向量检索和文档查询
 """
 import os
+from pathlib import Path
 from functools import lru_cache
 from typing import List
 from langgraph.graph import StateGraph, START, END
@@ -21,9 +22,25 @@ except ImportError:
 # ---------------------------
 
 CHROMA_PERSIST_PATH = os.getenv("CHROMA_PERSIST_PATH", "./chroma_db")
-CHROMA_COLLECTION = os.getenv("CHROMA_COLLECTION", "docs")
+CHROMA_COLLECTION = os.getenv("CHROMA_COLLECTION", "default_collection")
 EMBED_MODEL_NAME = os.getenv("EMBED_MODEL_NAME", "sentence-transformers/all-MiniLM-L6-v2")
-TOP_K = int(os.getenv("RAG_TOP_K", "5"))
+TOP_K = int(os.getenv("RAG_TOP_K", "3"))
+
+
+def _resolve_chroma_path(base_path: str, collection_name: str) -> str:
+    """兼容两种布局:
+    1) 旧布局: chroma_db/ + collection
+    2) 新布局: chroma_db/<collection_name>/ + collection
+    """
+    base = Path(base_path).resolve()
+    if base.name == collection_name and (base / "chroma.sqlite3").exists():
+        return str(base)
+
+    candidate = base / collection_name
+    if candidate.exists() and (candidate / "chroma.sqlite3").exists():
+        return str(candidate)
+
+    return str(base)
 
 
 # ---------------------------
@@ -41,8 +58,29 @@ class _STEmbeddingFunction:
     def __init__(self, model):
         self.model = model
 
-    def __call__(self, texts: List[str]):
+    def __call__(self, input: List[str]):
+        if isinstance(input, str):
+            texts = [input]
+        else:
+            texts = list(input or [])
+        if not texts:
+            return []
         return self.model.encode(texts, normalize_embeddings=True).tolist()
+
+    def embed_documents(self, input: List[str]):
+        return self.__call__(input)
+
+    def embed_query(self, input: str):
+        if isinstance(input, list):
+            text = input[0] if input else ""
+        else:
+            text = input or ""
+        if not text:
+            return []
+        return self.model.encode([text], normalize_embeddings=True).tolist()
+
+    def name(self):
+        return "sentence-transformer"
 
 
 @lru_cache(maxsize=1)
@@ -54,7 +92,8 @@ def _get_collection():
     if embedder is None:
         return None
     
-    client = chromadb.PersistentClient(path=CHROMA_PERSIST_PATH)
+    resolved_path = _resolve_chroma_path(CHROMA_PERSIST_PATH, CHROMA_COLLECTION)
+    client = chromadb.PersistentClient(path=resolved_path)
     embedding_fn = _STEmbeddingFunction(embedder)
     return client.get_or_create_collection(
         name=CHROMA_COLLECTION,
@@ -69,9 +108,19 @@ def _vector_search(query: str, top_k: int = TOP_K) -> List[str]:
         return ["向量库未配置，请检查 chromadb 和 sentence-transformers 是否已安装"]
     
     try:
-        result = collection.query(query_texts=[query], n_results=top_k)
+        result = collection.query(
+            query_texts=[query],
+            n_results=top_k,
+            include=["documents", "distances"],
+        )
         docs = result.get("documents") or []
         flat = docs[0] if docs else []
+        distances = (result.get("distances") or [[]])[0]
+
+        if flat and distances and len(flat) == len(distances):
+            ranked = sorted(zip(flat, distances), key=lambda x: x[1])
+            flat = [doc for doc, _ in ranked]
+
         if not flat:
             return ["未找到相关文献片段"]
         return flat
@@ -100,7 +149,14 @@ def search_documents(state: RAGAgentState) -> RAGAgentState:
     if current_step_expected_output:
         print(f"  --> 预期输出要求: {current_step_expected_output[:100]}...")
     
-    docs = _vector_search(query, top_k=TOP_K)
+    runtime_top_k = state.get("rag_top_k", TOP_K)
+    try:
+        runtime_top_k = int(runtime_top_k)
+    except Exception:
+        runtime_top_k = TOP_K
+    runtime_top_k = max(1, runtime_top_k)
+
+    docs = _vector_search(query, top_k=runtime_top_k)
     
     # 更新状态
     state["retrieved_docs"] = docs
@@ -113,6 +169,8 @@ def search_documents(state: RAGAgentState) -> RAGAgentState:
     state["rag_context"] = "\n\n".join(docs)
     
     print(f"  --> 检索到 {len(docs)} 条文档")
+
+    print(f"  --> 文档内容（前200字符）:\n{state['rag_context'][:200]}...")
     
     return state
 

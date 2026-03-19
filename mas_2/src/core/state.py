@@ -47,15 +47,17 @@ class GlobalState(TypedDict):
     
     # === 调度控制字段 ===
     # 下一个要执行的 worker（由 Supervisor 决定）
-    next_worker: Literal["rag_researcher", "code_dev", "data_analyst", "critic", "FINISH"]
+    next_worker: Literal["rag_researcher", "code_dev", "tool_caller", "data_analyst", "critic", "FINISH"]
     # 上一个执行的 worker（用于追踪）
     last_worker: str
     
     # === 产出字段 ===
     # 最终报告（整合所有结果）
     final_report: str
+    # 最终回答
+    final_answer: str
     # 代码解决方案
-    # code_solution: str
+    code_solution: Any
     # RAG 检索到的上下文
     rag_context: str
     

@@ -60,6 +60,16 @@ def generate_plan(state: SupervisorAgentState, retry_count: int = 0, max_retries
 3. 指定必须生成的输出文件路径（如果有）
 4. 包含明确的验收标准，用于判断任务是否成功
 
+【计划粒度要求】
+- 优先生成“最小可执行步骤集”，不要过度拆分。
+- 若用户目标是单一可交付物（例如“绘制一张UMAP图”），通常应规划为 1 个代码执行步骤即可完成。
+- 只有当任务确实存在明显依赖关系时，才拆成多个步骤。
+
+【RAG步骤规划原则】
+- 可以自主决定是否加入 RAG 检索步骤。
+- 当任务存在方法不确定性、参数不明确、需要领域依据时，建议先加 1 个 RAG 步骤。
+- 当任务非常基础且需求明确（例如常规 Scanpy 基础流程），可不加 RAG 步骤。
+
 对于代码开发任务，输出文件路径格式应为：{result_path}/step_{{step_id}}_{{filename}}
 例如：./result/step_1_umap.png, ./result/step_2_clustering.png
 
@@ -170,55 +180,30 @@ def make_decision(state: SupervisorAgentState) -> SupervisorAgentState:
             state["current_step_index"] = new_index
             current_step_index = new_index
     
-    # 如果有待审核内容，必须先审核
-    if pending_contribution:
-        state["next_worker"] = "critic"
-        return state
-    
-    # 如果计划存在且未完成，根据计划派遣任务
+    # 若有计划，则只负责提供当前步骤上下文给大模型，不做关键词硬路由
     if plan and current_step_index < len(plan):
         current_step = plan[current_step_index]
         print(f"  --> 当前执行步骤 {current_step_index + 1}/{len(plan)}: {current_step.name}")
-        
-        # 更新当前步骤的输入、预期输出和文件路径
+
         state["current_step_input"] = current_step.description
         state["current_step_expected_output"] = current_step.acceptance_criteria
         state["current_step_file_paths"] = {
             "input_files": current_step.input_files,
             "output_files": current_step.output_files
         }
-        
-        # 根据步骤描述决定派遣哪个 worker
-        step_desc_lower = current_step.description.lower()
-        step_name_lower = current_step.name.lower()
-        
-        # 判断任务类型
-        if any(keyword in step_desc_lower or keyword in step_name_lower 
-               for keyword in ["代码", "code", "编程", "执行", "运行", "分析", "处理数据"]):
-            state["next_worker"] = "code_dev"
-            print(f"  --> 派遣到 code_dev")
-        elif any(keyword in step_desc_lower or keyword in step_name_lower 
-                 for keyword in ["检索", "搜索", "文献", "文档", "查询", "search", "retrieve"]):
-            state["next_worker"] = "rag_researcher"
-            print(f"  --> 派遣到 rag_researcher")
-        elif any(keyword in step_desc_lower or keyword in step_name_lower 
-                 for keyword in ["工具", "数据库", "调用", "tool", "database", "查询基因", "鉴定"]):
-            state["next_worker"] = "tool_caller"
-            print(f"  --> 派遣到 tool_caller")
-        else:
-            # 默认使用动态决策
-            state = _make_dynamic_decision(state, user_query, rag_context, code_solution, 
-                                          final_report, is_approved, last_worker, pending_contribution)
-        
-        return state
-    
-    # 如果所有步骤已完成，检查是否还有待处理的任务
-    if plan and current_step_index >= len(plan):
-        print("  --> 所有计划步骤已完成")
-        state["next_worker"] = "FINISH"
-        return state
-    
-    # 如果没有计划或计划已完成，使用动态决策
+    elif plan and current_step_index >= len(plan):
+        # 关键收敛条件：计划已完成 + 无待审核内容 + 最近一步已审核通过 -> 直接结束
+        if is_approved and not pending_contribution:
+            print("  --> 所有计划步骤已完成且审核通过，直接 FINISH")
+            state["next_worker"] = "FINISH"
+            return state
+
+        print("  --> 所有计划步骤已完成，交由大模型决定是否 FINISH")
+        state["current_step_input"] = ""
+        state["current_step_expected_output"] = ""
+        state["current_step_file_paths"] = {"input_files": [], "output_files": []}
+
+    # 统一使用动态决策（包括是否 FINISH）
     return _make_dynamic_decision(state, user_query, rag_context, code_solution, 
                                   final_report, is_approved, last_worker, pending_contribution)
 
@@ -231,6 +216,16 @@ def _make_dynamic_decision(state: SupervisorAgentState, user_query: str, rag_con
     当没有计划或需要动态调整时使用
     """
     
+    plan = state.get("plan", [])
+    current_step_index = state.get("current_step_index", 0)
+    current_step_input = state.get("current_step_input", "")
+    current_step_expected_output = state.get("current_step_expected_output", "")
+
+    plan_progress = f"{current_step_index}/{len(plan)}" if plan else "无计划"
+    current_step_name = ""
+    if plan and 0 <= current_step_index < len(plan):
+        current_step_name = plan[current_step_index].name
+
     # 构建决策 Prompt
     # 注意：DashScope API 要求当使用 response_format: json_object 时，消息中必须包含 "json" 字样
     system_prompt = """你是项目经理，负责协调多个 AI 代理完成用户任务。
@@ -250,6 +245,10 @@ def _make_dynamic_decision(state: SupervisorAgentState, user_query: str, rag_con
     user_prompt = f"""
 当前项目状态：
 - 用户问题: {user_query}
+- 计划进度: {plan_progress}
+- 当前步骤名称: {current_step_name if current_step_name else "无"}
+- 当前步骤输入: {current_step_input if current_step_input else "无"}
+- 当前步骤验收标准: {current_step_expected_output if current_step_expected_output else "无"}
 - RAG 上下文: {"已获取" if rag_context else "未获取"}
 - 代码解决方案: {"已生成" if code_solution else "未生成"}
 - 最终报告: {"已生成" if final_report else "未生成"}
@@ -259,16 +258,18 @@ def _make_dynamic_decision(state: SupervisorAgentState, user_query: str, rag_con
 
 可用的 Worker：
 1. rag_researcher: 检索相关文献和文档
-2. code_dev: 生成和执行代码
-3. tool_caller: 分析用户问题，调用工具返回结果（比如给定DE 基因鉴定细胞型种类）
+2. code_dev: 生成和执行代码（包含数据读取、预处理、聚类、UMAP绘图、结果文件生成）
+3. tool_caller: 仅用于调用现有内置工具（run_celltype_annotation / gene_set_enrichment / query_mygene）
 4. critic: 审核工作成果
 5. FINISH: 任务完成
 
 决策原则：
-- 只有当必须要搜索的内容，才调用 rag_researcher；默认不调用
+- 可自主决定是否先调用 rag_researcher：
+    - 当任务存在方法不确定性、参数不明确、需要领域依据时，优先考虑先检索
+    - 当任务非常基础且目标明确时，可直接进入 code_dev
 - 如果有待审核内容，必须调用 critic
-- 如果需要生成代码，调用 code_dev
-- 如果需要调用现有工具，调用 tool_caller
+- 若任务需要编写或执行 Python 代码（例如读取 h5ad、运行 scanpy、绘制 UMAP、保存图片/文件），必须调用 code_dev
+- 只有当任务本身是“调用内置工具接口”时才调用 tool_caller，不要把常规分析/绘图任务派给 tool_caller
 - 如果所有工作都已完成，返回 FINISH
 
 请返回 JSON 格式的决策结果，包含 next_worker 和 reasoning 两个字段。

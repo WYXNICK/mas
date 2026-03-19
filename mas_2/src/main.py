@@ -3,7 +3,9 @@
 将所有 SubGraph Agent 连接成完整的工作流
 """
 from langgraph.graph import StateGraph, START, END
+from langchain_core.messages import SystemMessage, HumanMessage
 from src.core.state import GlobalState
+from src.core.llm import get_llm
 
 # 导入所有编译好的子图
 from src.agents.supervisor.graph import supervisor_agent_graph
@@ -59,6 +61,8 @@ def supervisor_router(state: GlobalState) -> str:
         return "rag_researcher"
     elif next_worker == "code_dev":
         return "code_dev"
+    elif next_worker == "tool_caller":
+        return "tool_caller"
     elif next_worker == "data_analyst":
         # data_analyst 使用 tool_caller 实现
         return "tool_caller"
@@ -106,26 +110,159 @@ def finalize_step(state: GlobalState) -> GlobalState:
     最终化节点：整合所有结果，生成最终答案
     """
     print("\n=== [Finalize] 生成最终答案 ===")
-    
+
+    def _truncate(text: str, max_len: int = 8000) -> str:
+        text = str(text or "").strip()
+        if len(text) <= max_len:
+            return text
+        return text[:max_len] + "\n...(内容过长已截断)"
+
+    def _format_plan(plan) -> str:
+        if not plan:
+            return "无"
+
+        lines = []
+        for idx, step in enumerate(plan, start=1):
+            if hasattr(step, "step_id"):
+                step_id = getattr(step, "step_id", idx)
+                name = getattr(step, "name", "")
+                description = getattr(step, "description", "")
+                acceptance = getattr(step, "acceptance_criteria", "")
+                input_files = getattr(step, "input_files", []) or []
+                output_files = getattr(step, "output_files", []) or []
+            elif isinstance(step, dict):
+                step_id = step.get("step_id", idx)
+                name = step.get("name", "")
+                description = step.get("description", "")
+                acceptance = step.get("acceptance_criteria", "")
+                input_files = step.get("input_files", []) or []
+                output_files = step.get("output_files", []) or []
+            else:
+                lines.append(f"{idx}. {step}")
+                continue
+
+            lines.append(f"{step_id}. {name}")
+            if description:
+                lines.append(f"   - 说明: {description}")
+            if input_files:
+                lines.append(f"   - 输入: {', '.join(map(str, input_files))}")
+            if output_files:
+                lines.append(f"   - 输出: {', '.join(map(str, output_files))}")
+            if acceptance:
+                lines.append(f"   - 验收: {acceptance}")
+
+        return "\n".join(lines)
+
+    def _format_code_solution(code_solution) -> str:
+        if not code_solution:
+            return ""
+        if not isinstance(code_solution, dict):
+            return str(code_solution)
+
+        code_text = str(code_solution.get("code", "")).strip()
+        exec_result = str(code_solution.get("result", "")).strip()
+        output_files = code_solution.get("output_files", []) or []
+
+        lines = []
+        if code_text:
+            lines.append("代码内容:")
+            lines.append(code_text)
+        if exec_result:
+            lines.append("执行结果:")
+            lines.append(exec_result)
+        if output_files:
+            lines.append("产出文件:")
+            lines.extend([f"- {f}" for f in output_files])
+
+        return "\n".join(lines)
+
     # 整合所有结果
+    user_query = state.get("user_query", "")
+    plan = state.get("plan", [])
+    current_step_index = state.get("current_step_index", 0)
     rag_context = state.get("rag_context", "")
     code_solution = state.get("code_solution", "")
     final_report = state.get("final_report", "")
-    
-    # 构建最终答案
-    parts = []
+    critique_feedback = state.get("critique_feedback", "")
+    is_approved = state.get("is_approved", False)
+    pending_contribution = state.get("pending_contribution", "")
+
+    plan_text = _format_plan(plan)
+    code_solution_text = _format_code_solution(code_solution)
+
+    # 先准备兜底答案，确保任何情况下都有输出
+    fallback_parts = []
     if rag_context:
-        parts.append(f"【相关文献】\n{rag_context}")
-    if code_solution:
-        parts.append(f"【代码方案】\n{code_solution}")
+        fallback_parts.append(f"【相关文献】\n{rag_context}")
+    if code_solution_text:
+        fallback_parts.append(f"【代码方案】\n{code_solution_text}")
     if final_report:
-        parts.append(f"【分析报告】\n{final_report}")
-    
-    if not parts:
-        final_answer = state.get("user_query", "任务已完成")
-    else:
-        final_answer = "\n\n".join(parts)
-    
+        fallback_parts.append(f"【分析报告】\n{final_report}")
+    if critique_feedback:
+        fallback_parts.append(f"【审核反馈】\n{critique_feedback}")
+
+    fallback_answer = "\n\n".join(fallback_parts) if fallback_parts else user_query or "任务已完成"
+
+    # 用 LLM 进行最终整合
+    system_prompt = (
+        "你是多智能体系统的最终答复整合器。"
+        "请基于用户原始问题、执行计划和各环节中间结果，"
+        "产出一份结构清晰、结论明确、可直接给用户查看的最终回答。"
+        "回答要求："
+        "1) 先给结论，再给关键依据；"
+        "2) 对代码执行结果与产出文件要明确点出；"
+        "3) 若信息不足，明确说明缺口，不要编造；"
+        "4) 使用中文，简洁专业。"
+    )
+
+    user_prompt = f"""
+请整合以下上下文，生成最终回答。
+
+[用户原始问题]
+{_truncate(user_query, 2000)}
+
+[执行计划]
+{_truncate(plan_text, 5000)}
+
+[当前步骤索引]
+{current_step_index}
+
+[RAG 检索上下文]
+{_truncate(rag_context, 8000)}
+
+[代码执行产出]
+{_truncate(code_solution_text, 8000)}
+
+[分析报告]
+{_truncate(final_report, 8000)}
+
+[Critic 审核信息]
+是否通过: {is_approved}
+反馈: {_truncate(str(critique_feedback), 2000)}
+
+[待审核贡献（如有）]
+{_truncate(str(pending_contribution), 4000)}
+""".strip()
+
+    final_answer = ""
+    try:
+        llm = get_llm(temperature=0.2)
+        response = llm.invoke([
+            SystemMessage(content=system_prompt),
+            HumanMessage(content=user_prompt)
+        ])
+        llm_content = getattr(response, "content", "")
+
+        if isinstance(llm_content, list):
+            llm_content = "\n".join(str(item) for item in llm_content)
+
+        final_answer = str(llm_content).strip()
+        if not final_answer:
+            raise ValueError("LLM 返回空内容")
+    except Exception as e:
+        print(f"[Finalize] LLM 汇总失败，使用兜底答案: {e}")
+        final_answer = fallback_answer
+
     return {
         **state,
         "final_answer": final_answer,

@@ -20,12 +20,12 @@ class CodeExecutor:
         """
         初始化代码执行器
         """
+        self.logger = logging.getLogger(__name__)
         self.docker_available = self._check_docker_availability()
         self.code_path = f"{docker_path}/code.py"
         self.requirements_path = f"{docker_path}/requirements.txt"
         self.output_dir = output_dir if output_dir else "/tmp/output"  # 默认输出目录
         self.docker_image = "python:3.13-slim"
-        self.logger = logging.getLogger(__name__)
         
         # --- 关键修改 1：使用列表存储挂载信息，避免字典 Key 冲突 ---
         self.volume_mounts = []
@@ -205,18 +205,22 @@ class CodeExecutor:
 
                 self.logger.info(f"运行容器，镜像: {image_tag}")
                 
-                user = f"{os.getuid()}:{os.getgid()}"
-                
-                container = self.client.containers.run(
-                    image=image_tag,
-                    volumes=self.volume_mounts,  # <--- 直接传列表
-                    environment=env_vars,
-                    user=user,
-                    mem_limit=mem_limit,
-                    network_mode='bridge',
-                    detach=True,
-                    auto_remove=False
-                )
+                run_kwargs = {
+                    'image': image_tag,
+                    'volumes': self.volume_mounts,  # <--- 直接传列表
+                    'environment': env_vars,
+                    'mem_limit': mem_limit,
+                    'network_mode': 'bridge',
+                    'detach': True,
+                    'auto_remove': False,
+                }
+                if hasattr(os, 'getuid') and hasattr(os, 'getgid'):
+                    try:
+                        run_kwargs['user'] = f"{os.getuid()}:{os.getgid()}"
+                    except Exception as e:
+                        self.logger.warning(f"无法获取当前用户 UID/GID，将使用 Docker 默认用户: {e}")
+
+                container = self.client.containers.run(**run_kwargs)
 
                 try:
                     container.wait(timeout=timeout)

@@ -50,6 +50,11 @@ class CodeExecutor:
             mount_str = f"{os.path.abspath(self.code_path)}:/app/code.py:ro"
             self.volume_mounts.append(mount_str)
 
+        # 挂载 requirements 文件（如存在）
+        if os.path.exists(self.requirements_path):
+            mount_str = f"{os.path.abspath(self.requirements_path)}:/app/requirements.txt:ro"
+            self.volume_mounts.append(mount_str)
+
         # 挂载数据目录（支持多个）
         for idx, data_dir_path in enumerate(self.data_dirs):
             if not os.path.exists(data_dir_path):
@@ -174,23 +179,9 @@ class CodeExecutor:
             }
 
         with tempfile.TemporaryDirectory() as temp_dir:
+            container = None
             try:
                 self._prepare_temp_directory(temp_dir)
-                import uuid
-                image_tag = f"code-executor-{uuid.uuid4().hex[:8]}"
-
-                self.logger.info(f"构建Docker镜像: {image_tag}")
-                self._create_dockerfile(temp_dir)
-
-                self.client.images.build(
-                    path=temp_dir,
-                    tag=image_tag,
-                    rm=True,
-                    forcerm=True
-                )
-
-                # --- 关键修改 4：不需要解析 volumes 字典，直接使用列表 ---
-                # self.volume_mounts 已经是符合 Docker SDK 格式的列表了
 
                 env_vars = {
                     'PYTHONUNBUFFERED': '1',
@@ -203,10 +194,13 @@ class CodeExecutor:
                 if environment_vars:
                     env_vars.update(environment_vars)
 
-                self.logger.info(f"运行容器，镜像: {image_tag}")
+                command = "sh -lc \"if [ -f /app/requirements.txt ]; then pip install --no-cache-dir -r /app/requirements.txt; fi; python /app/code.py\""
+
+                self.logger.info(f"运行容器，镜像: {self.docker_image}")
                 
                 run_kwargs = {
-                    'image': image_tag,
+                    'image': self.docker_image,
+                    'command': command,
                     'volumes': self.volume_mounts,  # <--- 直接传列表
                     'environment': env_vars,
                     'mem_limit': mem_limit,
@@ -226,9 +220,10 @@ class CodeExecutor:
                     container.wait(timeout=timeout)
                 except Exception as e:
                     self.logger.warning(f"容器等待超时或出错: {e}")
-                    container.stop(timeout=10)
-                    container.remove(force=True)
-                    self.client.images.remove(image=image_tag, force=True)
+                    try:
+                        container.stop(timeout=10)
+                    except Exception as stop_err:
+                        self.logger.warning(f"容器停止失败: {stop_err}")
                     return {
                         'success': False,
                         'error': f'执行超时: {e}',
@@ -250,24 +245,11 @@ class CodeExecutor:
                                 'size_mb': file_path.stat().st_size / (1024 * 1024)
                             })
 
-                container.remove(force=True)
-                self.client.images.remove(image=image_tag, force=True)
-
                 return {
                     'success': True,
                     'output': logs,
                     'files': output_files,
-                    'image_tag': image_tag,
                     'container_id': container.id[:12]
-                }
-
-            except docker.errors.BuildError as e:
-                self.logger.error(f"镜像构建失败: {e}")
-                return {
-                    'success': False,
-                    'error': f'镜像构建失败: {e}',
-                    'output': '',
-                    'files': []
                 }
             except Exception as e:
                 self.logger.error(f"执行失败: {e}")
@@ -277,3 +259,9 @@ class CodeExecutor:
                     'output': '',
                     'files': []
                 }
+            finally:
+                if container is not None:
+                    try:
+                        container.remove(force=True)
+                    except Exception as remove_container_err:
+                        self.logger.warning(f"容器清理失败: {remove_container_err}")

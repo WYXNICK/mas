@@ -61,7 +61,7 @@ Supervisor（规划与调度）
                               Supervisor 判断全部完成
                                     │
                                     ▼
-                               Finalize（汇总报告）
+                               Finalize（LLM汇总最终答复）
 ```
 
 ### 状态流转（GlobalState）
@@ -95,10 +95,9 @@ Supervisor（规划与调度）
 - `acceptance_criteria`（验收标准，传递给 Critic）
 
 **调度逻辑**：
-- 步骤描述含"代码/编程/执行/分析" → 派遣 `code_dev`
-- 步骤描述含"检索/文献/知识" → 派遣 `rag_researcher`
-- 步骤描述含"工具/数据库/查询基因/鉴定" → 派遣 `tool_caller`
-- 全部步骤完成 → `FINISH`（触发 Finalize）
+- 先根据当前计划步骤写入步骤上下文（输入、验收标准、输入/输出文件路径）
+- 由 LLM 结合项目状态动态决策下一个 Worker（`rag_researcher` / `code_dev` / `tool_caller` / `critic` / `FINISH`）
+- 当计划步骤全部完成，且最近步骤已审核通过、无待审核内容时，直接 `FINISH`
 
 ---
 
@@ -197,11 +196,11 @@ chainlit run app.py -w
 1. 用户在聊天框输入分析需求（如"请对提供的 10x 数据进行聚类和细胞类型鉴定"）
 2. `build_initial_state(user_query)` 构建初始状态
 3. `graph.stream()` 流式运行主图，实时展示各 Agent 输出：
-   - Supervisor：输出执行计划和当前步骤
-   - Code Dev：展示生成的代码、执行日志、输出图片
-   - Tool Caller：展示工具调用报告
-   - Critic：展示审核结论与反馈
-   - Finalize：展示最终汇总报告
+      - Supervisor：输出执行计划和当前步骤
+      - Code Dev：展示生成的代码、执行日志、输出图片
+      - Tool Caller：展示工具调用报告
+      - Critic：展示审核结论与反馈
+      - Finalize：展示 LLM 整合后的最终答复（失败时回退兜底内容）
 4. 结果保存到 `results/chainlit_result_<timestamp>.json`
 
 ### 配置文件
@@ -271,13 +270,13 @@ pip install -r requirements.txt
 
 ```env
 # LLM 服务（DashScope 兼容 OpenAI 接口）
-API_KEY=your_dashscope_api_key
+OPENAI_API_KEY=your_dashscope_api_key
 BASE_URL=https://dashscope.aliyuncs.com/compatible-mode/v1
-MODEL_NAME=qwen-turbo
+MODEL_NAME=qwen-turbo-latest
 TEMPERATURE=0.5
 
 # LangSmith 追踪（可选）
-LANGCHAIN_TRACING_V2=true
+LANGCHAIN_TRACING_V2=false
 LANGCHAIN_API_KEY=your_langsmith_api_key
 LANGCHAIN_PROJECT=mas_2
 ```

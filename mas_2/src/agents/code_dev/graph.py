@@ -59,6 +59,24 @@ def parse_paths_from_query(user_query: str) -> dict:
             paths["data_path"] = path_str
             break
 
+    # 兜底识别：如“data/ 目录下”这类描述（优先于文件名识别）
+    if not paths["data_path"]:
+        dir_match = re.search(r'([A-Za-z0-9_./\\-]+[/\\])\s*目录', user_query, re.IGNORECASE)
+        if dir_match:
+            dir_path = dir_match.group(1).strip('"\' ')
+            paths["data_path"] = dir_path
+
+    # 兜底识别：从自然语言中提取常见数据文件路径（如 data/pbmc3k.h5ad）
+    if not paths["data_path"]:
+        file_match = re.search(
+            r'([A-Za-z0-9_./\\-]+\.(?:h5ad|h5|csv|tsv|mtx|loom))',
+            user_query,
+            re.IGNORECASE,
+        )
+        if file_match:
+            file_path = file_match.group(1).strip('"\' ')
+            paths["data_path"] = file_path
+
     # 尝试匹配结果路径
     for pattern in result_patterns:
         match = re.search(pattern, user_query, re.IGNORECASE)
@@ -142,14 +160,24 @@ def generate_code(state: CodeAgentState) -> CodeAgentState:
 
     # 构建 Prompt：如果有反馈，说明是修正模式
     context_instruction = ""
+    previous_code = state.get("scanpy_code", "")
+    previous_requirements = state.get("requirements_txt", "")
+
     if state.get("feedback"):
         context_instruction = f"""
         【重要！这是修改重试】
         上一次生成的代码或结果被审核员驳回。
         驳回意见/错误信息：{final_feedback}
-        请根据上述意见修改代码。
+        上一次代码如下：
+        ```python
+        {previous_code}
+        ```
+        上一次 requirements.txt 如下：
+        ```txt
+        {previous_requirements}
+        ```
+        请基于上述代码进行修复，而不是完全无关重写；并根据报错更新 requirements.txt和代码。
         """
-
     # 获取当前步骤的输入、预期输出和文件路径
     current_step_input = state.get('current_step_input', '')
     current_step_expected_output = state.get('current_step_expected_output', '')
@@ -200,7 +228,7 @@ def generate_code(state: CodeAgentState) -> CodeAgentState:
     docker_output_path = convert_to_docker_path(result_path, 'output') if result_path else '/app/output'
 
     system_prompt = f"""
-你是专业的单细胞数据分析工程师，仅返回【纯Python代码】（无解释、无注释、无markdown）和 【纯requirement.txt包列表】（无解释、无注释），必须严格遵守：
+你是专业的单细胞数据分析工程师，请仅返回 Python 代码和 requirement.txt 包列表（无额外解释），并严格按下方代码块格式输出，必须严格遵守：
 1. 只使用Leiden聚类（sc.tl.leiden），禁止使用Louvain聚类（sc.tl.louvain）；
 2. 完整导入所有依赖，确保代码能独立运行；
 4. UMAP图标题固定为'Clustering UMAP'，无特殊字符；
@@ -226,9 +254,20 @@ def generate_code(state: CodeAgentState) -> CodeAgentState:
    - 结果保存路径：{docker_output_path}
    - 如果保存图片，必须使用 `plt.savefig()` 并指定完整路径，不要使用 `show=True`。
 
+17. **一次运行成功优先 (Robust First-Run)**:
+    - 避免因为“可补救的缺失字段”直接抛异常并退出；优先尝试自动补救。
+    - 对单细胞对象优先按以下顺序做容错：
+      1) 若缺少归一化/对数变换则执行 `normalize_total` + `log1p`
+      2) 若缺少高变基因可按默认参数计算
+      3) 若缺少 PCA 则执行 `sc.tl.pca`
+      4) 若缺少 neighbors 则执行 `sc.pp.neighbors`
+      5) 若缺少 UMAP 坐标则执行 `sc.tl.umap`
+    - 检查注释信息请使用 `adata.obs`（不要把 `obs` 当作 `adata.uns` 的键）。
+    - 输出结果时尽量给出可用摘要，不要因为次要信息缺失导致整段失败。
+
 格式：
 python代码全部被包括在```python 和```之间
-requirement.txt内容全部被包括在```md 和 ```之间
+requirement.txt内容全部被包括在```txt 和 ```之间
 注意：请严格按照上述格式返回内容，确保代码和requirements.txt清晰分隔。
     """
         
@@ -276,16 +315,33 @@ requirement.txt内容全部被包括在```md 和 ```之间
         text = response.content
 
         # 提取代码块和 requirements
-        # 支持两种格式：```python 和 ```md（参考 umap_langgraph.py）
+        # requirements 支持多种标签，避免模型输出轻微变化导致解析失败
         python_pattern = r'```python\n(.*?)\n```'
-        requirements_pattern_md = r'```md\n(.*?)\n```'
-        requirements_pattern_requirements = r'```requirements\n(.*?)\n```'
+        requirements_patterns = [
+            r'```requirements(?:\.txt)?\n(.*?)\n```',
+            r'```txt\n(.*?)\n```',
+            r'```text\n(.*?)\n```',
+        ]
 
         python_match = re.search(python_pattern, text, re.DOTALL)
-        # 优先尝试 ```md 格式，如果没有则尝试 ```requirements 格式
-        requirements_match = re.search(requirements_pattern_md, text, re.DOTALL)
+        requirements_match = None
+        for pattern in requirements_patterns:
+            m = re.search(pattern, text, re.DOTALL | re.IGNORECASE)
+            if m:
+                requirements_match = m
+                break
+
+        # 兜底：允许“requirements.txt:”后直接给列表（无代码块）
         if not requirements_match:
-            requirements_match = re.search(requirements_pattern_requirements, text, re.DOTALL)
+            plain_req_match = re.search(
+                r'requirements(?:\.txt)?\s*[:：]\s*\n([\s\S]+)$',
+                text,
+                re.IGNORECASE,
+            )
+            if plain_req_match:
+                plain_req_text = plain_req_match.group(1).strip()
+                if plain_req_text:
+                    requirements_match = plain_req_match
 
         if python_match:
             code = python_match.group(1).strip()
@@ -303,7 +359,7 @@ requirement.txt内容全部被包括在```md 和 ```之间
         else:
             print("没有获取到 requirements.txt，使用默认值")
             # 默认 requirements
-            requirements = "scanpy>=1.9.0\nmatplotlib>=3.4.0\nnumpy>=1.21.0\npandas>=1.3.0\nscipy>=1.7.0\nanndata>=0.8.0\nigraph\nleidenalg"
+            requirements = "scanpy>=1.9.0\nmatplotlib>=3.4.0\nnumpy>=1.21.0\npandas>=1.3.0\nscipy>=1.7.0\nanndata>=0.8.0\nigraph"
 
         # 更新状态
         state["scanpy_code"] = code
@@ -499,8 +555,8 @@ except Exception as e:
                 for candidate in candidate_paths:
                     if os.path.exists(candidate):
                         actual_data_path = os.path.dirname(candidate) if os.path.isfile(candidate) else candidate
-                        print(f"  --> 在 result_path 中找到输入文件: {candidate}")
-                        print(f"  --> 使用 result_path 作为数据路径: {actual_data_path}")
+                        print(f"  --> 在候选路径中找到输入文件: {candidate}")
+                        print(f"  --> 使用该输入文件所在目录作为数据路径: {actual_data_path}")
                         break
                 else:
                     # 如果都没找到，检查是否在原始 data_path 中
@@ -523,7 +579,14 @@ except Exception as e:
                     print(f"  --> 输入文件不存在，但在 result_path 中找到同名文件: {candidate_in_result}")
                     print(f"  --> 使用 result_path 作为数据路径: {actual_data_path}")
         
-        # 如果 actual_data_path 为空或不存在，但有 result_path，使用 result_path
+        # 如果 actual_data_path 为空或不存在，优先尝试项目默认 data 目录
+        if not actual_data_path or not os.path.exists(actual_data_path):
+            default_data_dir = os.path.abspath("./data")
+            if os.path.exists(default_data_dir):
+                actual_data_path = default_data_dir
+                print(f"  --> 数据路径无效，使用默认 data 目录: {actual_data_path}")
+
+        # 如果仍无有效数据路径，再回退到 result_path
         if not actual_data_path or not os.path.exists(actual_data_path):
             if result_path and os.path.exists(result_path):
                 actual_data_path = result_path

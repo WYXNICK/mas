@@ -2,6 +2,8 @@
 主图编排模块
 将所有 SubGraph Agent 连接成完整的工作流
 """
+import os
+
 from langgraph.graph import StateGraph, START, END
 from langchain_core.messages import SystemMessage, HumanMessage
 from src.core.state import GlobalState
@@ -13,6 +15,7 @@ from src.agents.critic.graph import critic_agent_graph
 from src.agents.code_dev.graph import code_agent_graph
 from src.agents.rag_researcher.graph import rag_agent_graph
 from src.agents.tool_caller.graph import tool_caller_agent_graph
+from src.utils.docker_log_summary import summarize_docker_stdout
 
 
 # ==================== Wrapper 节点 ====================
@@ -161,6 +164,17 @@ def finalize_step(state: GlobalState) -> GlobalState:
 
         code_text = str(code_solution.get("code", "")).strip()
         exec_result = str(code_solution.get("result", "")).strip()
+        raw_output = str(code_solution.get("output", "")).strip()
+        display_output = str(code_solution.get("output_display", "")).strip()
+        if not display_output and raw_output:
+            display_output = summarize_docker_stdout(raw_output)
+        use_full_log = os.environ.get("MAS_FULL_EXEC_LOG_IN_FINALIZE", "").strip().lower() in (
+            "1",
+            "true",
+            "yes",
+        )
+        log_text = raw_output if use_full_log else display_output
+        log_label = "完整执行日志" if use_full_log else "压缩执行日志"
         output_files = code_solution.get("output_files", []) or []
 
         lines = []
@@ -168,8 +182,11 @@ def finalize_step(state: GlobalState) -> GlobalState:
             lines.append("代码内容:")
             lines.append(code_text)
         if exec_result:
-            lines.append("执行结果:")
+            lines.append("执行结果（===RESULT=== 提取）:")
             lines.append(exec_result)
+        if log_text:
+            lines.append(f"{log_label}:")
+            lines.append(log_text)
         if output_files:
             lines.append("产出文件:")
             lines.extend([f"- {f}" for f in output_files])
@@ -231,7 +248,7 @@ def finalize_step(state: GlobalState) -> GlobalState:
 {_truncate(rag_context, 8000)}
 
 [代码执行产出]
-{_truncate(code_solution_text, 8000)}
+{_truncate(code_solution_text, 256_000)}
 
 [分析报告]
 {_truncate(final_report, 8000)}
@@ -246,7 +263,7 @@ def finalize_step(state: GlobalState) -> GlobalState:
 
     final_answer = ""
     try:
-        llm = get_llm(temperature=0.2)
+        llm = get_llm(temperature=0.2, streaming=True)
         response = llm.invoke([
             SystemMessage(content=system_prompt),
             HumanMessage(content=user_prompt)

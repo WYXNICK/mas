@@ -11,7 +11,8 @@ def get_llm(
     model_name: Optional[str] = None,
     temperature: Optional[float] = None,
     base_url: Optional[str] = None,
-    api_key: Optional[str] = None
+    api_key: Optional[str] = None,
+    streaming: bool = False,
 ) -> ChatOpenAI:
     """
     创建并返回配置好的 ChatOpenAI 实例
@@ -29,6 +30,7 @@ def get_llm(
         api_key=api_key or config.API_KEY,
         base_url=base_url or config.BASE_URL,
         model=model_name or config.MODEL_NAME,
-        temperature=temperature if temperature is not None else config.DEFAULT_TEMPERATURE
+        temperature=temperature if temperature is not None else config.DEFAULT_TEMPERATURE,
+        streaming=streaming,
     )
 

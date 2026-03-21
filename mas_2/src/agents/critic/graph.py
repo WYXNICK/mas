@@ -341,7 +341,8 @@ def review_contribution(state: CriticAgentState) -> CriticAgentState:
         state["critique_feedback"] = None
         
         if last_worker == "code_dev":
-            state["code_solution"] = str(pending)
+            # 保留 dict，便于下游展示完整 output / result（勿 str() 丢失结构）
+            state["code_solution"] = pending if isinstance(pending, dict) else str(pending)
         elif last_worker == "rag_researcher":
             if isinstance(pending, list):
                 state["rag_context"] = "\n\n".join(pending)

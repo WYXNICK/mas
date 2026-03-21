@@ -92,7 +92,7 @@ reaction_on_message_received = false
 
 [UI]
 # Name of the assistant.
-name = "Assistant"
+name = "Data Analysis Agent: SJTU-BGI"
 
 # default_theme = "dark"
 

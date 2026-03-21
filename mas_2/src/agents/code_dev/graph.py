@@ -10,6 +10,7 @@ from langgraph.graph import StateGraph, START, END
 from .state import CodeAgentState
 from src.core.llm import get_llm
 from .executor import CodeExecutor
+from src.utils.docker_log_summary import summarize_docker_stdout
 from ._utils.docker_path import convert_to_docker_path
 from ._utils.base64_support import create_html_with_base64_image
 # 初始化 LLM
@@ -612,9 +613,10 @@ except Exception as e:
         try:
             result = executor.execute(timeout=600)  # 10分钟超时
 
-            # 打印执行日志
+            # 打印执行日志（控制台仅预览，完整内容写入 pending_contribution["output"]）
             output_str = result.get('output', '')
-            print(f"【Docker代码执行日志】: {output_str[:1000]}...")
+            _log_preview = output_str if len(output_str) <= 2000 else output_str[:2000] + "\n... (共 {} 字符，完整内容见界面)".format(len(output_str))
+            print(f"【Docker代码执行日志】\n{_log_preview}")
 
             # 检查执行是否成功（从executor返回的success字段）
             executor_success = result.get('success', True)
@@ -635,14 +637,16 @@ except Exception as e:
                 state["success"] = True  # 标记为成功
                 print("  --> 代码执行成功！已提取分析结果")
 
-                # 更新 pending_contribution
+                # 更新 pending_contribution（含完整容器标准输出，便于前端展示）
                 state["pending_contribution"] = {
                     "code": code,
                     "requirements": requirements,
                     "task": state.get("task", ""),
                     "result": state["analysis_result"],
                     "success": True,
-                    "output_files": result.get('files', [])
+                    "output_files": result.get('files', []),
+                    "output": output_str,
+                    "output_display": summarize_docker_stdout(output_str),
                 }
             else:
                 # 执行失败或没有找到结果标记
@@ -661,11 +665,6 @@ except Exception as e:
                         )
                         if traceback_match:
                             error_msg = traceback_match.group(1).strip()
-                            # 如果traceback太长，只保留最后的关键部分
-                            if len(error_msg) > 500:
-                                lines = error_msg.split('\n')
-                                # 保留前3行（Traceback开始）和最后5行（错误信息）
-                                error_msg = '\n'.join(lines[:3] + ['...'] + lines[-5:])
                         else:
                             # 如果没找到完整traceback，提取包含错误的行
                             lines = output_str.split('\n')
@@ -682,11 +681,9 @@ except Exception as e:
                             if error_lines:
                                 error_msg = '\n'.join(error_lines).strip()
                     
-                    # 如果还是没找到，使用output的前500字符作为错误信息
+                    # 如果还是没找到，使用完整输出作为错误信息（便于排查）
                     if not error_msg:
-                        error_msg = output_str[:500].strip()
-                        if len(output_str) > 500:
-                            error_msg += "..."
+                        error_msg = output_str.strip()
                 
                 # 如果仍然没有错误信息，使用默认值
                 if not error_msg:
@@ -696,35 +693,40 @@ except Exception as e:
                 if "===RESULT===" not in output_str:
                     state["analysis_result"] = f"代码执行失败\\n错误信息：{error_msg}"
                 else:
-                    state["analysis_result"] = f"代码执行完成，但未找到结果标记\\n错误日志摘要：{error_msg}"
+                    state["analysis_result"] = f"代码执行完成，但未找到结果标记\\n错误日志：{error_msg}"
                 
                 state["success"] = False
-                print(f"  --> 代码执行失败: {error_msg[:200]}...")
+                _fail_preview = error_msg if len(error_msg) <= 500 else error_msg[:500] + "..."
+                print(f"  --> 代码执行失败: {_fail_preview}")
 
-                # 更新 pending_contribution
+                # 更新 pending_contribution（完整 stdout，便于前端与 Critic 排查）
                 state["pending_contribution"] = {
                     "code": code,
                     "requirements": requirements,
                     "task": state.get("task", ""),
                     "error": error_msg,
                     "success": False,
-                    "output": output_str[:1000] if output_str else ""  # 保存部分输出用于调试
+                    "output": output_str or "",
+                    "output_display": summarize_docker_stdout(output_str or ""),
                 }
 
         except Exception as e:
             # 处理其他运行时错误（参考 umap_langgraph.py 的改进）
             error_msg = f"Docker代码运行失败：{str(e)}"
-            state["analysis_result"] = f"{error_msg}\\n错误日志：{result if 'result' in locals() else '无'}"
+            _r = locals().get("result")
+            _exec_log = (_r.get("output") or "") if isinstance(_r, dict) else ""
+            state["analysis_result"] = f"{error_msg}\\n错误日志：{_exec_log or '无'}"
             state["success"] = False
             print(f"  --> {error_msg}")
 
-            # 更新 pending_contribution
             state["pending_contribution"] = {
                 "code": code,
                 "requirements": requirements,
                 "task": state.get("task", ""),
                 "error": error_msg,
-                "success": False
+                "success": False,
+                "output": _exec_log,
+                "output_display": summarize_docker_stdout(_exec_log or ""),
             }
 
     return state

@@ -22,6 +22,7 @@ import json
 import os
 import shutil
 import subprocess
+import sys
 from pathlib import Path
 from typing import Dict, List, Optional, Tuple
 
@@ -35,9 +36,13 @@ from sentence_transformers import SentenceTransformer
 
 _SCRIPT_DIR = Path(__file__).resolve().parent
 _PROJECT_DIR = _SCRIPT_DIR.parent
+if str(_PROJECT_DIR) not in sys.path:
+    sys.path.insert(0, str(_PROJECT_DIR))
+
+from src.utils.project_paths import resolve_chroma_persist_path  # noqa: E402
 
 DEFAULT_DOCS_DIR = _PROJECT_DIR / "rag_docs"
-DEFAULT_CHROMA_PATH = Path(os.getenv("CHROMA_PERSIST_PATH", str(_PROJECT_DIR / "chroma_db")))
+DEFAULT_CHROMA_PATH = resolve_chroma_persist_path()
 DEFAULT_COLLECTION = os.getenv("CHROMA_COLLECTION", "default_collection")
 DEFAULT_EMBED_MODEL = os.getenv("EMBED_MODEL_NAME", "sentence-transformers/all-MiniLM-L6-v2")
 SUPPORTED_SUFFIXES = {".txt", ".md", ".pdf"}
@@ -358,19 +363,22 @@ def _ingest(args: argparse.Namespace) -> None:
 
         current_chunk_ids: List[str] = []
 
+        skill_tag = (getattr(args, "skill_id", None) or "").strip() or None
+
         for cidx, chunk in enumerate(chunks):
             doc_id = _build_doc_id(source_namespace, rel_path, cidx)
             all_ids.append(doc_id)
             current_chunk_ids.append(doc_id)
             all_docs.append(chunk)
-            all_metadatas.append(
-                {
-                    "source": rel_path,
-                    "file_type": suffix.lstrip("."),
-                    "chunk_index": cidx,
-                    "total_chunks": len(chunks),
-                }
-            )
+            meta = {
+                "source": rel_path,
+                "file_type": suffix.lstrip("."),
+                "chunk_index": cidx,
+                "total_chunks": len(chunks),
+            }
+            if skill_tag:
+                meta["skill_id"] = skill_tag
+            all_metadatas.append(meta)
 
         new_files[rel_path] = {
             "fingerprint": fp,
@@ -490,6 +498,11 @@ def _build_arg_parser() -> argparse.ArgumentParser:
     parser.add_argument("--run-recall-test", action="store_true", help="入库后执行召回测试")
     parser.add_argument("--query", default="", help="召回测试使用的查询语句")
     parser.add_argument("--top-k", type=int, default=3, help="召回测试返回条数")
+    parser.add_argument(
+        "--skill-id",
+        default=None,
+        help="可选：写入每条 chunk 的 metadata['skill_id']，供 RAG 按技能过滤（如 workflow 目录名）",
+    )
     return parser
 
 

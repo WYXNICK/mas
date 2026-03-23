@@ -5,10 +5,11 @@ Supervisor Agent 子图
 from langchain_core.messages import SystemMessage, HumanMessage
 from langgraph.graph import StateGraph, START, END
 from pydantic import BaseModel, Field
-from typing import Literal, List
+from typing import Literal, List, Optional
 from .state import SupervisorAgentState
 from src.core.llm import get_llm
 from src.core.state import PlanStep
+from src.utils.workflow_skills import format_skills_catalog_for_prompt
 
 # 初始化 LLM
 llm = get_llm(temperature=0.5)
@@ -51,14 +52,33 @@ def generate_plan(state: SupervisorAgentState, retry_count: int = 0, max_retries
         retry_hint += "2. 每个步骤的字段都完整填写\n"
         retry_hint += "3. step_id 从1开始，连续递增\n"
         retry_hint += "4. 所有必填字段（step_id, name, description, acceptance_criteria）都有值\n"
-    
-    system_prompt = """你是一个专业的项目规划师，负责将复杂的任务分解为可执行的步骤。
+        retry_hint += "5. skill_id 可为空：仅当步骤明确对应下方目录中的某一技能时填写\n"
+
+    skills_catalog = format_skills_catalog_for_prompt()
+
+    system_prompt = f"""你是一个专业的项目规划师，负责将复杂的任务分解为可执行的步骤。
 
 请根据用户的任务需求，生成一个详细的执行计划。每个步骤应该：
 1. 有明确的输入和输出
 2. 指定需要的输入文件路径（如果有）
 3. 指定必须生成的输出文件路径（如果有）
 4. 包含明确的验收标准，用于判断任务是否成功
+
+【可用 Workflow 技能目录】
+以下 id 可与步骤绑定（字段 skill_id）；标有【试点】的为早期端到端验收用例，其余技能同样会挂载技能目录供代码引用。
+{skills_catalog}
+
+【skill_id 规则】
+- 若某步骤明显遵循某一技能的标准流程，请填写对应的 skill_id（与上表 id=`...` 完全一致）。
+- 不确定、或任务与上表无关时，skill_id 可省略（或 null）。
+
+【数据路径与 input_files】
+- 用户若在任务中说明了数据位置（例如「数据路径：…」「输入为 xxx.h5ad」），必须在依赖该数据的步骤的 input_files 中填入具体路径（与原文一致）；不要将路径只写在 description 而遗漏 input_files。
+- 多文件输入时，按依赖顺序列出全部需要的文件路径。
+
+【验收标准 acceptance_criteria】
+- 若步骤填写了 skill_id，验收标准应对齐该技能 SKILL 文档中的交付物与检查点（可用简要条目概括）。
+- 验收标准须可判定：明确输出文件、图表或数值结论应满足什么条件才算成功。
 
 【计划粒度要求】
 - 优先生成“最小可执行步骤集”，不要过度拆分。
@@ -83,11 +103,12 @@ def generate_plan(state: SupervisorAgentState, retry_count: int = 0, max_retries
 - step_id: 步骤序号（从1开始，必须连续递增）
 - name: 步骤名称（简短的动词短语，必填）
 - description: 详细的任务描述，包含具体的参数要求（必填）
-- input_files: 本步骤需要的输入文件路径列表（如果没有则为空列表 []）
+- input_files: 本步骤需要的输入文件路径列表（用户已提供数据路径时必须填入；无则 []）
 - output_files: 本步骤必须生成的输出文件路径列表（格式：{result_path}/step_{{step_id}}_{{filename}}，如果没有则为空列表 []）
-- acceptance_criteria: 验收标准，明确说明如何判断任务成功（必填）
+- acceptance_criteria: 验收标准，明确说明如何判断任务成功；若绑定 skill_id 则与 SKILL 文档要点一致（必填）
+- skill_id: 可选，字符串或 null。若本步骤绑定上表中的某一技能则填写其 id，否则为 null。
 
-请确保计划覆盖用户任务的所有要求，并且所有字段都正确填写。
+请确保计划覆盖用户任务的所有要求，并且所有字段都正确填写。若用户给出了结果/输出目录，计划中 output_files 的路径前缀应与用户期望一致。
 """
     
     try:
@@ -141,6 +162,49 @@ def generate_plan(state: SupervisorAgentState, retry_count: int = 0, max_retries
     return state
 
 
+def _step_needs_execution_beyond_rag(step: Optional[PlanStep]) -> bool:
+    """
+    当前计划步骤在 RAG 之后是否还需要 code_dev / tool 等交付产物。
+    若为 True，则 RAG 经 Critic 通过后不推进 current_step_index，避免单步「绘图」类任务在只做 RAG 后就 FINISH。
+    """
+    if step is None:
+        return False
+    outs = list(getattr(step, "output_files", None) or [])
+    if outs:
+        return True
+    blob = " ".join(
+        [
+            str(getattr(step, "name", "") or ""),
+            str(getattr(step, "description", "") or ""),
+            str(getattr(step, "acceptance_criteria", "") or ""),
+        ]
+    ).lower()
+    hints = (
+        "python",
+        "代码",
+        "执行",
+        "docker",
+        "绘图",
+        "绘制",
+        "可视化",
+        "figure",
+        "plot",
+        ".png",
+        ".pdf",
+        ".jpg",
+        "matplotlib",
+        "scanpy",
+        "seaborn",
+        "qqman",
+        "plotly",
+        "输出文件",
+        "脚本",
+        "保存图",
+        "manhattan",
+    )
+    return any(h in blob for h in hints)
+
+
 def make_decision(state: SupervisorAgentState) -> SupervisorAgentState:
     """
     决策节点
@@ -167,18 +231,29 @@ def make_decision(state: SupervisorAgentState) -> SupervisorAgentState:
         plan = state.get("plan", [])
         current_step_index = state.get("current_step_index", 0)
     
-    # 步骤推进逻辑：如果上一步审核通过，且不是critic执行的，则推进步骤索引
+    # 步骤推进逻辑：如果上一步审核通过，且不是 critic 执行的，则推进步骤索引
+    # 注意：仅 RAG 通过不能算作「代码/交付类」步骤完成，否则单步计划会在 RAG 后直接 FINISH。
     if plan and is_approved and last_worker != "critic" and last_worker:
-        # 上一步审核通过，推进到下一步
-        new_index = current_step_index + 1
-        if new_index < len(plan):
-            state["current_step_index"] = new_index
-            current_step_index = new_index
-            print(f"  --> 步骤 {current_step_index} 审核通过，推进到步骤 {current_step_index + 1}")
+        skip_advance = (
+            last_worker == "rag_researcher"
+            and 0 <= current_step_index < len(plan)
+            and _step_needs_execution_beyond_rag(plan[current_step_index])
+        )
+        if skip_advance:
+            print(
+                "  --> RAG 已通过，本步仍需代码/工具交付，暂不推进步骤索引，继续当前步"
+            )
         else:
-            # 所有步骤已完成
-            state["current_step_index"] = new_index
-            current_step_index = new_index
+            new_index = current_step_index + 1
+            if new_index < len(plan):
+                state["current_step_index"] = new_index
+                current_step_index = new_index
+                print(
+                    f"  --> 步骤 {current_step_index} 审核通过，推进到步骤 {current_step_index + 1}"
+                )
+            else:
+                state["current_step_index"] = new_index
+                current_step_index = new_index
     
     # 若有计划，则只负责提供当前步骤上下文给大模型，不做关键词硬路由
     if plan and current_step_index < len(plan):
@@ -191,6 +266,8 @@ def make_decision(state: SupervisorAgentState) -> SupervisorAgentState:
             "input_files": current_step.input_files,
             "output_files": current_step.output_files
         }
+        sid = getattr(current_step, "skill_id", None)
+        state["current_step_skill_id"] = sid if sid else None
     elif plan and current_step_index >= len(plan):
         # 关键收敛条件：计划已完成 + 无待审核内容 + 最近一步已审核通过 -> 直接结束
         if is_approved and not pending_contribution:
@@ -202,6 +279,7 @@ def make_decision(state: SupervisorAgentState) -> SupervisorAgentState:
         state["current_step_input"] = ""
         state["current_step_expected_output"] = ""
         state["current_step_file_paths"] = {"input_files": [], "output_files": []}
+        state["current_step_skill_id"] = None
 
     # 统一使用动态决策（包括是否 FINISH）
     return _make_dynamic_decision(state, user_query, rag_context, code_solution, 

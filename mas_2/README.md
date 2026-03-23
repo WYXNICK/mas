@@ -150,7 +150,8 @@ generate_code → self_reflection → execute_code
 **职责**：从本地向量数据库中检索与当前步骤相关的文献知识。
 
 **实现**：
-- 向量库：ChromaDB（持久化到 `chroma_db/`）
+- 向量库：ChromaDB（持久化目录）
+- 未设置 `CHROMA_PERSIST_PATH` 时，默认使用 **`<mas_2 项目根>/chroma_db`**（由 `src/utils/project_paths.py` 锚定，**不依赖** Notebook 或 shell 的当前工作目录）。自定义时请在该环境变量中填写路径（建议绝对路径），并与 `scripts/parse_docs.py` 入库时使用同一值。
 - 嵌入模型：SentenceTransformer
 - 检索结果写入 `retrieved_docs` 和 `pending_contribution`
 

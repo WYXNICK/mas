@@ -8,6 +8,7 @@ from langchain_core.messages import SystemMessage, HumanMessage
 from langgraph.graph import StateGraph, START, END
 from .state import CriticAgentState
 from src.core.llm import get_llm
+from src.utils.workflow_skills import format_skill_for_critic
 
 # 初始化 LLM
 llm = get_llm(temperature=0.1) # 建议降低温度，让审核更死板、更守规矩
@@ -113,8 +114,9 @@ def check_umap_image(image_base64: str, query: str, expected_output: str = None,
     return response.content
 
 
-def check_code(content: str, query: str, execution_result: str = None, 
-               expected_output: str = None, step_context: dict = None) -> str:
+def check_code(content: str, query: str, execution_result: str = None,
+               expected_output: str = None, step_context: dict = None,
+               skill_note: str = None) -> str:
     """审核代码"""
     # --- 针对代码审核的强化 Prompt ---
     code_system_prompt = """
@@ -159,6 +161,8 @@ def check_code(content: str, query: str, execution_result: str = None,
         else:
             execution_note += "提示：日志显示执行可能存在问题，请仔细检查报错信息。\n"
 
+    skill_extra = skill_note or ""
+
     user_prompt = f"""
     用户问题: {query}
     待审核代码: 
@@ -166,7 +170,7 @@ def check_code(content: str, query: str, execution_result: str = None,
     {content}
     ```
     {execution_note}
-    {step_context_note}{expected_output_note}
+    {step_context_note}{expected_output_note}{skill_extra}
     """
     
     response = llm.invoke([
@@ -298,22 +302,33 @@ def review_contribution(state: CriticAgentState) -> CriticAgentState:
         
         # 2. 强制提取错误信息
         if not is_exec_success:
-            # 如果标记为失败，必须提取错误，即使 error 字段为空也要从 output 里找
             error_msg = pending.get("error", "")
             if not error_msg:
-                error_msg = pending.get("output", "Unknown execution error")
+                error_msg = (
+                    pending.get("output_tail")
+                    or pending.get("output_display")
+                    or pending.get("output")
+                    or "Unknown execution error"
+                )
             execution_result = f"EXECUTION FAILED (CRITICAL):\n{error_msg}"
         else:
-            # 如果成功，提取结果
             result_msg = pending.get("result", "")
             if not result_msg:
-                result_msg = pending.get("output", "Execution successful but no output.")
+                result_msg = (
+                    pending.get("output_display")
+                    or pending.get("output_tail")
+                    or pending.get("output")
+                    or "Execution successful but no output."
+                )
             execution_result = f"EXECUTION SUCCESS:\n{result_msg}"
             
         # 3. 打印调试信息，确保我们知道传给 LLM 的是什么
         print(f"  --> [Debug] 传给 Critic 的执行结果片段: {execution_result[:100]}...")
         
-        feedback = check_code(code, query, execution_result, expected_output, step_context)
+        skill_note = format_skill_for_critic(state.get("current_step_skill_id"))
+        feedback = check_code(
+            code, query, execution_result, expected_output, step_context, skill_note=skill_note
+        )
         state["content_type"] = "code"
     
     # 其他类型检查...
@@ -329,7 +344,10 @@ def review_contribution(state: CriticAgentState) -> CriticAgentState:
     
     else:
         content_str = str(pending)
-        feedback = check_code(content_str, query, None, expected_output, step_context)
+        skill_note = format_skill_for_critic(state.get("current_step_skill_id"))
+        feedback = check_code(
+            content_str, query, None, expected_output, step_context, skill_note=skill_note
+        )
         state["content_type"] = "code"
     
     # 判断是否通过

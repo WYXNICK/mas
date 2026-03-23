@@ -3,6 +3,7 @@
 使用 Docker 容器安全执行生成的代码
 """
 import os
+import shlex
 import tempfile
 import docker
 import shutil
@@ -15,10 +16,13 @@ logging.basicConfig(level=logging.INFO)
 class CodeExecutor:
     """使用 Docker 容器执行代码的执行器"""
     
-    def __init__(self, docker_path: str, data_dir: str = None, data_dirs: list = None, 
-                 output_dir: str = None, input_files: list = None):
+    def __init__(self, docker_path: str, data_dir: str = None, data_dirs: list = None,
+                 output_dir: str = None, input_files: list = None,
+                 workflow_host_path: str = None):
         """
         初始化代码执行器
+
+        workflow_host_path: 若提供，将宿主目录只读挂载到容器内 /app/workflow（供 SKILL 内 scripts 导入）。
         """
         self.logger = logging.getLogger(__name__)
         self.docker_available = self._check_docker_availability()
@@ -84,6 +88,12 @@ class CodeExecutor:
         # --- 关键修改 3：追加输出目录挂载 ---
         mount_str = f"{os.path.abspath(self.output_dir)}:/app/output:rw"
         self.volume_mounts.append(mount_str)
+
+        self.workflow_host_path = workflow_host_path
+        if workflow_host_path and os.path.isdir(workflow_host_path):
+            wf = os.path.abspath(workflow_host_path)
+            self.volume_mounts.append(f"{wf}:/app/workflow:ro")
+            self.logger.info(f"Workflow 目录挂载: {wf} -> /app/workflow")
     
     def _determine_data_dirs_from_input_files(self, input_files: list):
         """
@@ -135,29 +145,6 @@ class CodeExecutor:
             self.logger.error(f"FAILED.Docker客户端初始化失败: {e}")
             return False
 
-    def _create_dockerfile(self, temp_dir: str, output_mount_path: str | None = None):
-        dockerfile_lines = [
-            f"FROM {self.docker_image}",
-            "WORKDIR /app",
-            "RUN mkdir -p /app/data /app/output"
-        ]
-
-        if os.path.exists(self.requirements_path):
-            shutil.copy2(self.requirements_path, os.path.join(temp_dir, "requirements.txt"))
-            dockerfile_lines.extend([
-                "COPY requirements.txt .",
-                "RUN pip install --no-cache-dir -r requirements.txt",
-            ])
-
-        dockerfile_lines.append('CMD ["python", "code.py"]')
-
-        dockerfile_content = "\n".join(dockerfile_lines)
-        dockerfile_path = os.path.join(temp_dir, 'Dockerfile')
-        with open(dockerfile_path, 'w') as f:
-            f.write(dockerfile_content)
-
-        return dockerfile_path
-
     def _prepare_temp_directory(self, temp_dir: str) -> None:
         shutil.copy2(self.code_path, os.path.join(temp_dir, 'code.py'))
         if os.path.exists(self.requirements_path):
@@ -186,15 +173,29 @@ class CodeExecutor:
                 env_vars = {
                     'PYTHONUNBUFFERED': '1',
                     'DEBIAN_FRONTEND': 'noninteractive',
-                    'MPLCONFIGDIR': '/tmp/matplotlib',
-                    'NUMBA_CACHE_DIR': '/tmp/numba',
+                    'MPLCONFIGDIR': '/app/output/.mas_mpl',
+                    'NUMBA_CACHE_DIR': '/app/output/.mas_numba',
                     'HOME': '/tmp',
-                    'PYTHONPYCACHEPREFIX': '/tmp/__pycache__',
+                    'PYTHONPYCACHEPREFIX': '/app/output/.mas_pycache',
+                    'PIP_DISABLE_PIP_VERSION_CHECK': '1',
                 }
                 if environment_vars:
                     env_vars.update(environment_vars)
 
-                command = "sh -lc \"if [ -f /app/requirements.txt ]; then pip install --no-cache-dir -r /app/requirements.txt; fi; python /app/code.py\""
+                # set -e：pip 失败则不再执行 python，避免「装包失败仍跑代码」导致 ModuleNotFoundError 误导。
+                # --target /app/output/.mas_pydeps：依赖装在挂载卷上，避免容器 /tmp 爆满与非 root 下 user-site 不一致。
+                # TMPDIR 指向 /app/output：pip 解压大 wheel 时不占满容器临时层。
+                _container_script = """set -e
+export PYTHONPATH="/app/workflow${PYTHONPATH:+:$PYTHONPATH}"
+DEPS=/app/output/.mas_pydeps
+export TMPDIR=/app/output/.mas_tmp
+mkdir -p "$TMPDIR" "$DEPS" "$MPLCONFIGDIR" "$NUMBA_CACHE_DIR" "$PYTHONPYCACHEPREFIX"
+if [ -f /app/requirements.txt ] && [ -s /app/requirements.txt ]; then
+  python -m pip install --no-cache-dir --upgrade -r /app/requirements.txt --target "$DEPS"
+fi
+export PYTHONPATH="$DEPS:$PYTHONPATH"
+python /app/code.py"""
+                command = "bash -lc " + shlex.quote(_container_script)
 
                 self.logger.info(f"运行容器，镜像: {self.docker_image}")
                 

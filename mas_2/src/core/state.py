@@ -23,6 +23,10 @@ class PlanStep(BaseModel):
     input_files: List[str] = Field(default=[], description="本步骤需要的输入文件路径列表")
     output_files: List[str] = Field(default=[], description="本步骤必须生成的输出文件路径列表（如果有）")
     acceptance_criteria: str = Field(..., description="验收标准，告诉Critic如何判断任务成功")
+    skill_id: Optional[str] = Field(
+        default=None,
+        description="可选：绑定的 workflow 技能 id（mas_2/workflows/<id>/SKILL.md），与领域 SOP 对齐",
+    )
 
 class GlobalState(TypedDict):
     """
@@ -44,7 +48,9 @@ class GlobalState(TypedDict):
     current_step_input: Optional[str]  # 当前步骤的输入描述（从 plan[current_step_index].description 提取）
     current_step_expected_output: Optional[str]  # 当前步骤的预期输出（从 plan[current_step_index].acceptance_criteria 提取）
     current_step_file_paths: Optional[dict]  # 当前步骤的文件路径信息 {"input_files": [...], "output_files": [...]}
-    
+    # 当前步骤绑定的 workflow skill_id（来自 plan[current_step_index].skill_id）
+    current_step_skill_id: Optional[str]
+
     # === 调度控制字段 ===
     # 下一个要执行的 worker（由 Supervisor 决定）
     next_worker: Literal["rag_researcher", "code_dev", "tool_caller", "data_analyst", "critic", "FINISH"]

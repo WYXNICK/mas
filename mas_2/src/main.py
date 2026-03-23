@@ -3,6 +3,7 @@
 将所有 SubGraph Agent 连接成完整的工作流
 """
 import os
+from pathlib import Path
 
 from langgraph.graph import StateGraph, START, END
 from langchain_core.messages import SystemMessage, HumanMessage
@@ -26,15 +27,6 @@ def wrap_rag_researcher(state: GlobalState) -> GlobalState:
     return {
         **result,
         "last_worker": "rag_researcher"
-    }
-
-
-def wrap_code_dev(state: GlobalState) -> GlobalState:
-    """包装 Code Dev，更新 last_worker"""
-    result = code_agent_graph.invoke(state)
-    return {
-        **result,
-        "last_worker": "code_dev"
     }
 
 
@@ -153,6 +145,12 @@ def finalize_step(state: GlobalState) -> GlobalState:
                 lines.append(f"   - 输出: {', '.join(map(str, output_files))}")
             if acceptance:
                 lines.append(f"   - 验收: {acceptance}")
+            if isinstance(step, dict):
+                skill_id = step.get("skill_id")
+            else:
+                skill_id = getattr(step, "skill_id", None)
+            if skill_id:
+                lines.append(f"   - skill_id: {skill_id}")
 
         return "\n".join(lines)
 
@@ -166,15 +164,28 @@ def finalize_step(state: GlobalState) -> GlobalState:
         exec_result = str(code_solution.get("result", "")).strip()
         raw_output = str(code_solution.get("output", "")).strip()
         display_output = str(code_solution.get("output_display", "")).strip()
+        tail_output = str(code_solution.get("output_tail", "")).strip()
+        log_disk = str(code_solution.get("output_log_path", "")).strip()
         if not display_output and raw_output:
             display_output = summarize_docker_stdout(raw_output)
+        if not display_output and tail_output:
+            display_output = summarize_docker_stdout(tail_output)
         use_full_log = os.environ.get("MAS_FULL_EXEC_LOG_IN_FINALIZE", "").strip().lower() in (
             "1",
             "true",
             "yes",
         )
-        log_text = raw_output if use_full_log else display_output
-        log_label = "完整执行日志" if use_full_log else "压缩执行日志"
+        if use_full_log:
+            log_text = raw_output
+            if not log_text and log_disk:
+                try:
+                    log_text = Path(log_disk).read_text(encoding="utf-8")
+                except OSError:
+                    log_text = display_output or tail_output
+            log_label = "完整执行日志"
+        else:
+            log_text = display_output or tail_output or raw_output
+            log_label = "压缩执行日志"
         output_files = code_solution.get("output_files", []) or []
 
         lines = []
@@ -298,7 +309,8 @@ workflow.add_node("critic", critic_agent_graph)
 
 # Worker 节点使用 wrapper 函数，确保更新 last_worker
 workflow.add_node("rag_researcher", wrap_rag_researcher)
-workflow.add_node("code_dev", wrap_code_dev)
+# 子图直接挂入主图，便于 astream_events 暴露 generate_code / execute_code 等内部节点
+workflow.add_node("code_dev", code_agent_graph)
 workflow.add_node("tool_caller", wrap_tool_caller)  # data_analyst 使用 tool_caller
 
 # Finalize 节点

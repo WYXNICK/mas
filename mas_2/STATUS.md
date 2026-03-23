@@ -38,10 +38,25 @@
    ```
 
 4. 可选环境变量（与 `rag_researcher/graph.py` 一致）：
-   - `CHROMA_PERSIST_PATH`：Chroma 持久化目录（默认 `./chroma_db`）
-   - `CHROMA_COLLECTION`：集合名（默认 `docs`）
+   - `CHROMA_PERSIST_PATH`：Chroma 持久化根目录；未设置时默认为 **`<mas_2 根>/chroma_db`**（与 CWD 无关，见 `src/utils/project_paths.py`）。自定义时建议绝对路径，并与入库脚本一致。
+   - `CHROMA_COLLECTION`：集合名（默认 `default_collection`）
 
 未执行入库前，RAG Researcher 仍会运行，但检索结果为空，效果不符合预期属正常现象。
+
+### Workflow 技能（试点）
+
+- **注册与计划**：[`src/utils/workflow_skills.py`](src/utils/workflow_skills.py) 扫描 `workflows/*/SKILL.md`；Supervisor 生成计划时注入技能短目录，每步可填可选字段 **`skill_id`**（与 `id=\`...\`` 一致）。
+- **状态**：`GlobalState.current_step_skill_id` 随当前步骤同步；Finalize 展示计划时可带 `skill_id`。
+- **Code Dev**：试点三条（`gwas-to-function-twas`、`scrna-trajectory-inference`、`scrnaseq-scanpy-core-analysis`）在 Docker 内将对应目录**只读挂载**为 `/app/workflow`，并设置 `PYTHONPATH`；仅 **`scrnaseq-scanpy-core-analysis`** 沿用原 Scanpy 专用 system prompt 与执行头；其余两条使用通用 workflow 提示词与非 Scanpy 执行头。
+- **Critic**：审核代码时附带当前 `skill_id` 说明，避免用不相关的 Scanpy 标准误杀。
+- **向量入库（可选）**：对试点目录批量入库可运行：
+
+  ```bash
+  cd mas_2
+  python scripts/ingest_workflow_pilots.py
+  ```
+
+  （内部多次调用 `scripts/parse_docs.py`，与 `CHROMA_PERSIST_PATH` / `--target-collection` 等参数兼容。）
 
 ---
 
@@ -50,7 +65,7 @@
 | 模块 | 状态 | 说明 |
 |------|------|------|
 | Supervisor | ✅ | 计划生成 + 按步骤/动态派遣；已能正确派发 tool_caller |
-| Code Dev | ✅ | 代码生成与执行、结果审核流程正常 |
+| Code Dev | ✅ | 代码生成与执行；支持试点 workflow 挂载 `/app/workflow` 与按 skill 切换提示词 |
 | Critic | ✅ | 代码/文档/工具结果审核；通过后正确写入 code_solution / rag_context / final_report |
 | RAG Researcher | ⚠️ 需先入库 | 检索逻辑正常；**需先运行 `scripts/ingest_rag.py` 写入文档** |
 | Tool Caller | ✅ | 路由已修复；工具注册与执行正常，需 Supervisor 派发到本节点 |

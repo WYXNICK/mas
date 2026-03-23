@@ -5,9 +5,10 @@ RAG Researcher Agent 子图
 import os
 from pathlib import Path
 from functools import lru_cache
-from typing import List
+from typing import List, Optional
 from langgraph.graph import StateGraph, START, END
 from .state import RAGAgentState
+from src.utils.project_paths import resolve_chroma_persist_path
 
 try:
     import chromadb
@@ -21,10 +22,11 @@ except ImportError:
 # 配置
 # ---------------------------
 
-CHROMA_PERSIST_PATH = os.getenv("CHROMA_PERSIST_PATH", "./chroma_db")
 CHROMA_COLLECTION = os.getenv("CHROMA_COLLECTION", "default_collection")
 EMBED_MODEL_NAME = os.getenv("EMBED_MODEL_NAME", "sentence-transformers/all-MiniLM-L6-v2")
 TOP_K = int(os.getenv("RAG_TOP_K", "3"))
+# 为 1 时：若当前步骤有 skill_id，则优先按 metadata skill_id 过滤；无结果时回退为全库检索
+RAG_SKILL_FILTER = os.getenv("RAG_SKILL_FILTER", "1").strip().lower() not in ("0", "false", "no", "off")
 
 
 def _resolve_chroma_path(base_path: str, collection_name: str) -> str:
@@ -92,7 +94,9 @@ def _get_collection():
     if embedder is None:
         return None
     
-    resolved_path = _resolve_chroma_path(CHROMA_PERSIST_PATH, CHROMA_COLLECTION)
+    resolved_path = _resolve_chroma_path(
+        str(resolve_chroma_persist_path()), CHROMA_COLLECTION
+    )
     client = chromadb.PersistentClient(path=resolved_path)
     embedding_fn = _STEmbeddingFunction(embedder)
     return client.get_or_create_collection(
@@ -101,26 +105,41 @@ def _get_collection():
     )
 
 
-def _vector_search(query: str, top_k: int = TOP_K) -> List[str]:
-    """向量检索函数"""
+def _vector_search(
+    query: str,
+    top_k: int = TOP_K,
+    skill_id: Optional[str] = None,
+) -> List[str]:
+    """向量检索；可选按 chunk metadata skill_id 过滤（与 parse_docs --skill-id 入库一致）。"""
     collection = _get_collection()
     if collection is None:
         return ["向量库未配置，请检查 chromadb 和 sentence-transformers 是否已安装"]
-    
-    try:
-        result = collection.query(
-            query_texts=[query],
-            n_results=top_k,
-            include=["documents", "distances"],
-        )
+
+    sid = (skill_id or "").strip() or None
+
+    def _run(where: Optional[dict]) -> List[str]:
+        kwargs = {
+            "query_texts": [query],
+            "n_results": top_k,
+            "include": ["documents", "distances"],
+        }
+        if where:
+            kwargs["where"] = where
+        result = collection.query(**kwargs)
         docs = result.get("documents") or []
         flat = docs[0] if docs else []
         distances = (result.get("distances") or [[]])[0]
-
         if flat and distances and len(flat) == len(distances):
             ranked = sorted(zip(flat, distances), key=lambda x: x[1])
             flat = [doc for doc, _ in ranked]
+        return flat
 
+    try:
+        flat: List[str] = []
+        if RAG_SKILL_FILTER and sid:
+            flat = _run({"skill_id": sid})
+        if not flat:
+            flat = _run(None)
         if not flat:
             return ["未找到相关文献片段"]
         return flat
@@ -156,7 +175,11 @@ def search_documents(state: RAGAgentState) -> RAGAgentState:
         runtime_top_k = TOP_K
     runtime_top_k = max(1, runtime_top_k)
 
-    docs = _vector_search(query, top_k=runtime_top_k)
+    docs = _vector_search(
+        query,
+        top_k=runtime_top_k,
+        skill_id=state.get("current_step_skill_id"),
+    )
     
     # 更新状态
     state["retrieved_docs"] = docs

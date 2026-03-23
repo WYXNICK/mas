@@ -5,16 +5,123 @@ Code Developer Agent 子图
 import os
 import re
 import tempfile
+import uuid
+from datetime import datetime
+from pathlib import Path
 from langchain_core.messages import SystemMessage, HumanMessage, AIMessage
 from langgraph.graph import StateGraph, START, END
 from .state import CodeAgentState
 from src.core.llm import get_llm
 from .executor import CodeExecutor
 from src.utils.docker_log_summary import summarize_docker_stdout
+from src.utils.project_paths import get_mas2_project_root
+from src.utils.workflow_skills import (
+    format_skill_injection_for_code_dev,
+    resolve_workflow_root,
+    should_mount_workflow_in_docker,
+    use_scanpy_code_style,
+)
 from ._utils.docker_path import convert_to_docker_path
+from ._utils.llm_code_sanitize import sanitize_llm_python_block
 from ._utils.base64_support import create_html_with_base64_image
 # 初始化 LLM
 llm = get_llm(temperature=0.1)
+
+_MAX_PENDING_ERROR_CHARS = 12000
+
+
+def _mas2_data_dir_candidates() -> list[str]:
+    """与进程 CWD 无关的数据目录候选（优先 mas_2/data，再 ./data）。"""
+    roots: list[str] = []
+    try:
+        roots.append(str(get_mas2_project_root() / "data"))
+    except RuntimeError:
+        pass
+    roots.append(os.path.abspath("./data"))
+    return roots
+
+
+def _env_truthy(name: str) -> bool:
+    return os.environ.get(name, "").strip().lower() in ("1", "true", "yes", "on")
+
+
+def _exec_output_tail(text: str, n_lines: int) -> str:
+    if not text:
+        return ""
+    lines = text.splitlines()
+    if len(lines) <= n_lines:
+        return text
+    return "\n".join(lines[-n_lines:])
+
+
+def _tail_line_count() -> int:
+    try:
+        return max(10, int(os.environ.get("MAS_EXEC_OUTPUT_TAIL_LINES", "80")))
+    except ValueError:
+        return 80
+
+
+def _maybe_write_full_exec_log(output_str: str) -> str | None:
+    """MAS_SAVE_FULL_EXEC_LOG=1 时将完整 stdout 写入 mas_2/results，返回绝对路径。"""
+    if not output_str or not _env_truthy("MAS_SAVE_FULL_EXEC_LOG"):
+        return None
+    root = Path(__file__).resolve().parents[3]
+    results_dir = root / "results"
+    try:
+        results_dir.mkdir(parents=True, exist_ok=True)
+        log_name = f"exec_full_{datetime.now().strftime('%Y%m%d_%H%M%S')}_{uuid.uuid4().hex[:8]}.log"
+        path = results_dir / log_name
+        path.write_text(output_str, encoding="utf-8")
+        return str(path.resolve())
+    except OSError:
+        return None
+
+
+def _build_execute_pending_contribution(
+    *,
+    code: str,
+    requirements: str,
+    task: str,
+    output_str: str,
+    success: bool,
+    result_value: str | None = None,
+    error_msg: str | None = None,
+    output_files: list | None = None,
+) -> dict:
+    """
+    执行后写入 pending_contribution：默认不含完整 output，含 output_display / output_tail；
+    MAS_KEEP_FULL_EXEC_OUTPUT_IN_STATE=1 时附带 output；MAS_SAVE_FULL_EXEC_LOG=1 时落盘并写 output_log_path。
+    """
+    out = output_str or ""
+    tail_n = _tail_line_count()
+    output_tail = _exec_output_tail(out, tail_n)
+    disp = summarize_docker_stdout(out)
+    log_path = _maybe_write_full_exec_log(out)
+    pending: dict = {
+        "code": code,
+        "requirements": requirements,
+        "task": task,
+        "success": success,
+        "output_display": disp,
+        "output_tail": output_tail,
+    }
+    if log_path:
+        pending["output_log_path"] = log_path
+    if _env_truthy("MAS_KEEP_FULL_EXEC_OUTPUT_IN_STATE"):
+        pending["output"] = out
+    if success:
+        pending["result"] = (result_value or "").strip()
+        if output_files is not None:
+            pending["output_files"] = output_files
+    else:
+        err = (error_msg or "").strip()
+        if len(err) > _MAX_PENDING_ERROR_CHARS:
+            err = (
+                err[:_MAX_PENDING_ERROR_CHARS]
+                + "\n...(pending.error 已截断；见 output_tail / output_log_path 或设置 MAS_KEEP_FULL_EXEC_OUTPUT_IN_STATE)"
+            )
+        pending["error"] = err
+    return pending
 
 
 def parse_paths_from_query(user_query: str) -> dict:
@@ -67,10 +174,10 @@ def parse_paths_from_query(user_query: str) -> dict:
             dir_path = dir_match.group(1).strip('"\' ')
             paths["data_path"] = dir_path
 
-    # 兜底识别：从自然语言中提取常见数据文件路径（如 data/pbmc3k.h5ad）
+    # 兜底识别：从自然语言中提取常见数据文件路径（含组学常见后缀）
     if not paths["data_path"]:
         file_match = re.search(
-            r'([A-Za-z0-9_./\\-]+\.(?:h5ad|h5|csv|tsv|mtx|loom))',
+            r"([A-Za-z0-9_./\\-]+\.(?:vcf\.gz|vcf\.bgz|bcf|vcf\.gz\.tbi|vcf|panel|bed|bim|fam|h5ad|h5|csv|tsv|mtx|loom))",
             user_query,
             re.IGNORECASE,
         )
@@ -228,48 +335,47 @@ def generate_code(state: CodeAgentState) -> CodeAgentState:
 
     docker_output_path = convert_to_docker_path(result_path, 'output') if result_path else '/app/output'
 
-    system_prompt = f"""
-你是专业的单细胞数据分析工程师，请仅返回 Python 代码和 requirement.txt 包列表（无额外解释），并严格按下方代码块格式输出，必须严格遵守：
-1. 只使用Leiden聚类（sc.tl.leiden），禁止使用Louvain聚类（sc.tl.louvain）；
-2. 完整导入所有依赖，确保代码能独立运行；
-4. UMAP图标题固定为'Clustering UMAP'，无特殊字符；
-5. 生成给docker环境的requirements.txt，确保包含所有代码中用到的包。
-6. 代码将在 Docker 容器中运行
-7. 重要！！代码中调取的数据必须为{docker_data_path}, 不可更改！！！不接受supervisor agent任何关于调取数据的修改建议!!!
-8. 重要！！代码中存储文件结果必须在{docker_output_path}下, 不可更改！！！
-9. 必须使用 print(f"===RESULT==={{analysis_summary}}===") 输出结果标记
-10. 如果生成图片，请保存到 {docker_output_path} 目录
-11. 根据数据格式来判断用什么方法进行读取，如是h5ad格式，使用sc.read_h5ad。
-12. 如果是单细胞数据，默认保存为.h5ad格式。
-13. requirement.txt内容必须包含所有代码中用到的包。
-14. **依赖链条 (Dependency Chain)**:
-   - **执行 UMAP/聚类前必须计算邻近图**：在调用 `sc.tl.umap`、`sc.tl.leiden` 或 `sc.tl.louvain` 之前，**必须** 显式调用 `sc.pp.neighbors(adata)`（除非你确定 .uns['neighbors'] 已存在）。
-   - **绘图前必须确保数据存在**：在调用 `sc.pl.umap(adata, color='leiden')` 之前，**必须** 先运行 `sc.tl.leiden(adata)`。严禁在没有计算聚类的情况下尝试绘制聚类图。
+    skill_id = state.get("current_step_skill_id")
+    inj_limit = 12000 if use_scanpy_code_style(skill_id) else 4500
+    skill_block = format_skill_injection_for_code_dev(skill_id, max_chars=inj_limit)
 
-15. **防御性编程 (Defensive Coding)**:
-   - **检查列是否存在**：在访问 `adata.obs['leiden']` 或其他列之前，使用 `if 'leiden' in adata.obs:` 进行检查。
-   - **不要硬编码中间文件名**：严格使用用户指令中指定的 `输入文件路径` 和 `输出文件路径`。不要自己编造如 `step_3_pca.h5ad` 这样的文件名，除非任务明确要求读取它。
+    if use_scanpy_code_style(skill_id):
+        system_prompt = f"""
+你是专业的单细胞数据分析工程师，请仅返回 Python 代码和 requirement.txt 包列表（无额外解释），并严格按下方代码块格式输出。
 
-16. **路径与环境**:
-   - 数据读取路径：{docker_data_path}
-   - 结果保存路径：{docker_output_path}
-   - 如果保存图片，必须使用 `plt.savefig()` 并指定完整路径，不要使用 `show=True`。
+【Docker 路径（不可改）】读取数据：{docker_data_path}；写入产出：{docker_output_path}。
+【输出契约】必须使用 print(f"===RESULT==={{analysis_summary}}===")；requirements.txt 须列出代码中所有第三方依赖。
+【流程与 API】Leiden/UMAP/邻域图顺序、防御性检查、容错与绘图要求以注入的 SKILL 中 **「MAS Code Agent contract (Docker / generated code)」** 为准，并与本技能 `scripts/` 用法、全文说明一致。
 
-17. **一次运行成功优先 (Robust First-Run)**:
-    - 避免因为“可补救的缺失字段”直接抛异常并退出；优先尝试自动补救。
-    - 对单细胞对象优先按以下顺序做容错：
-      1) 若缺少归一化/对数变换则执行 `normalize_total` + `log1p`
-      2) 若缺少高变基因可按默认参数计算
-      3) 若缺少 PCA 则执行 `sc.tl.pca`
-      4) 若缺少 neighbors 则执行 `sc.pp.neighbors`
-      5) 若缺少 UMAP 坐标则执行 `sc.tl.umap`
-    - 检查注释信息请使用 `adata.obs`（不要把 `obs` 当作 `adata.uns` 的键）。
-    - 输出结果时尽量给出可用摘要，不要因为次要信息缺失导致整段失败。
+{skill_block}
 
 格式：
 python代码全部被包括在```python 和```之间
 requirement.txt内容全部被包括在```txt 和 ```之间
 注意：请严格按照上述格式返回内容，确保代码和requirements.txt清晰分隔。
+【禁止】在 ```python 代码块内部再写任何 ``` 或 ```python 行；代码块内只能是可执行的 Python 源码。
+    """
+    else:
+        system_prompt = f"""
+你是 Python 工程师（任务可能是科学计算、组学分析或其它领域）。请仅返回 Python 代码和 requirements.txt 包列表（无额外解释），严格按下方代码块格式输出。
+
+【勿默认套用单细胞 Scanpy 流程】除非任务描述或下方 Workflow/SKILL 明确要求（如 h5ad、Leiden、UMAP），否则不要使用 scanpy，也不要假设存在 AnnData。
+
+【Workflow 技能上下文】
+{skill_block}
+
+【硬性约束】
+1. 代码在 Docker 内运行。若任务需要读数据/写文件：读取使用 {docker_data_path}，写入使用 {docker_output_path}。若任务为纯计算且无文件 IO，不必强行读盘。
+2. 若存在 /app/workflow，可加入 sys.path 并复用其中 `scripts/`，与 SKILL 一致；不要随意重写 SKILL 已有脚本逻辑。
+3. 必须：print(f"===RESULT==={{analysis_summary}}===")，analysis_summary 为字符串，概括本步结果。
+4. requirements.txt 仅列出代码中实际 import 的第三方包；无第三方依赖时可留空。
+5. 【仅当任务需要绘图时】再使用 matplotlib（Agg 后端）、plt.savefig 到 {docker_output_path}，禁用 show=True。纯数值或无图任务不要 import 绘图库。
+6. 【禁止】在 ```python 代码块内部再写 ``` 或 ```python；块内仅含可执行 Python。
+7. 若用户提供了输入文件列表，必须使用其中的确切路径或 basename（挂载在 /app/data/），禁止臆造其它文件名。
+8. 读取 .panel / 样本列表等文本表时：先用 pandas.read_csv(..., sep=r"\\s+", comment='#', header=None) 或打印列名再选列，禁止假设存在名为 ID 的列。
+
+格式：
+python 代码在 ```python 与 ``` 之间；requirements 在 ```txt 与 ``` 之间。
     """
         
     # 3. 输出 analysis_summary 变量时需进行安全检查：
@@ -291,6 +397,10 @@ requirement.txt内容全部被包括在```txt 和 ```之间
     file_paths_note = ""
     if input_files:
         file_paths_note += f"\n【输入文件】\n" + "\n".join([f"- {f}" for f in input_files])
+        file_paths_note += (
+            "\n（Docker 内数据目录为 /app/data/，请用 os.path.join('/app/data', '<basename>') 或下列 basename 读取；"
+            "勿使用未出现在上述列表中的文件名。）"
+        )
     if output_files:
         file_paths_note += f"\n【必须生成的输出文件】\n" + "\n".join([f"- {f}" for f in output_files])
         # 确保输出文件保存到指定路径
@@ -317,14 +427,15 @@ requirement.txt内容全部被包括在```txt 和 ```之间
 
         # 提取代码块和 requirements
         # requirements 支持多种标签，避免模型输出轻微变化导致解析失败
-        python_pattern = r'```python\n(.*?)\n```'
+        # 允许 ```python / ```py、大小写及首尾空白；非贪婪匹配至第一个闭合 ```
+        python_pattern = r"```(?:python|py)\s*\n(.*?)```"
         requirements_patterns = [
             r'```requirements(?:\.txt)?\n(.*?)\n```',
             r'```txt\n(.*?)\n```',
             r'```text\n(.*?)\n```',
         ]
 
-        python_match = re.search(python_pattern, text, re.DOTALL)
+        python_match = re.search(python_pattern, text, re.DOTALL | re.IGNORECASE)
         requirements_match = None
         for pattern in requirements_patterns:
             m = re.search(pattern, text, re.DOTALL | re.IGNORECASE)
@@ -345,13 +456,13 @@ requirement.txt内容全部被包括在```txt 和 ```之间
                     requirements_match = plain_req_match
 
         if python_match:
-            code = python_match.group(1).strip()
+            code = sanitize_llm_python_block(python_match.group(1).strip())
             print("获取到了 code，前面部分内容：")
             print(code)
         else:
             # 如果没有代码块，尝试提取整个响应
             print("没有获取到 code，尝试提取整个响应")
-            code = text.strip()
+            code = sanitize_llm_python_block(text.strip())
 
         if requirements_match:
             requirements = requirements_match.group(1).strip()
@@ -440,11 +551,17 @@ def execute_code(state: CodeAgentState) -> CodeAgentState:
     os.makedirs(result_path, exist_ok=True)
 
     # 构建完整的可执行代码（参考 umap_langgraph.py 的改进）
-    header = f"""
+    _skill_for_exec = state.get("current_step_skill_id")
+    _use_scanpy_style = use_scanpy_code_style(_skill_for_exec)
+
+    if _use_scanpy_style:
+        header = f"""
 # 基础库导入（确保代码独立运行）
 import sys
 import os
 sys.path.append(os.getcwd())
+if '/app/workflow' not in sys.path:
+    sys.path.insert(0, '/app/workflow')
 import scanpy as sc
 import matplotlib.pyplot as plt
 
@@ -458,6 +575,8 @@ try:
     
     if os.path.exists('/app/output'):
         print(f"DEBUG: Files in /app/output: {{os.listdir('/app/output')}}")
+    if os.path.exists('/app/workflow'):
+        print(f"DEBUG: Files in /app/workflow: {{os.listdir('/app/workflow')}}")
 except Exception as e:
     print(f"DEBUG: Error checking directories: {{e}}")
 # --- DEBUG END ---
@@ -465,6 +584,29 @@ except Exception as e:
 # 关键配置
 plt.switch_backend('Agg')  # 关闭matplotlib弹窗
 sc.settings.verbosity = 3  # 显示Scanpy详细日志
+"""
+    else:
+        header = f"""
+import sys
+import os
+if '/app/workflow' not in sys.path:
+    sys.path.insert(0, '/app/workflow')
+sys.path.append(os.getcwd())
+
+# --- DEBUG START ---
+print("DEBUG: Checking /app/data contents...")
+try:
+    if os.path.exists('/app/data'):
+        print(f"DEBUG: Files in /app/data: {{os.listdir('/app/data')}}")
+    else:
+        print("DEBUG: /app/data does not exist!")
+    if os.path.exists('/app/output'):
+        print(f"DEBUG: Files in /app/output: {{os.listdir('/app/output')}}")
+    if os.path.exists('/app/workflow'):
+        print(f"DEBUG: Files in /app/workflow: {{os.listdir('/app/workflow')}}")
+except Exception as e:
+    print(f"DEBUG: Error checking directories: {{e}}")
+# --- DEBUG END ---
 """
 # 核心分析代码（来自大模型生成）
     llm_code = state.get("scanpy_code", "")
@@ -560,8 +702,19 @@ except Exception as e:
                         print(f"  --> 使用该输入文件所在目录作为数据路径: {actual_data_path}")
                         break
                 else:
-                    # 如果都没找到，检查是否在原始 data_path 中
-                    if data_path and os.path.exists(data_path):
+                    # 仅文件名时：在 mas_2/data 与 ./data 下按 basename 查找（不依赖 Notebook CWD）
+                    base = os.path.basename(first_input)
+                    found_in_project_data = False
+                    for root_candidate in _mas2_data_dir_candidates():
+                        if not root_candidate or not os.path.isdir(root_candidate):
+                            continue
+                        cand = os.path.join(root_candidate, base)
+                        if os.path.exists(cand):
+                            actual_data_path = root_candidate
+                            print(f"  --> 在数据目录 {root_candidate} 中找到输入文件: {cand}")
+                            found_in_project_data = True
+                            break
+                    if not found_in_project_data and data_path and os.path.exists(data_path):
                         candidate_in_data = os.path.join(data_path, first_input) if os.path.isdir(data_path) else None
                         if candidate_in_data and os.path.exists(candidate_in_data):
                             actual_data_path = data_path
@@ -572,20 +725,29 @@ except Exception as e:
                             print(f"  --> 未找到输入文件，使用 result_path 作为数据路径: {actual_data_path}")
             # 如果输入文件路径是绝对路径但不存在，检查是否在 result_path 中
             elif os.path.isabs(first_input) and not os.path.exists(first_input):
-                # 尝试在 result_path 中查找文件名
                 filename = os.path.basename(first_input)
                 candidate_in_result = os.path.join(result_path, filename)
                 if os.path.exists(candidate_in_result):
                     actual_data_path = result_path
                     print(f"  --> 输入文件不存在，但在 result_path 中找到同名文件: {candidate_in_result}")
                     print(f"  --> 使用 result_path 作为数据路径: {actual_data_path}")
+                else:
+                    for root_candidate in _mas2_data_dir_candidates():
+                        if not root_candidate or not os.path.isdir(root_candidate):
+                            continue
+                        cand = os.path.join(root_candidate, filename)
+                        if os.path.exists(cand):
+                            actual_data_path = root_candidate
+                            print(f"  --> 绝对路径无效，在 {root_candidate} 中找到同名文件: {cand}")
+                            break
         
-        # 如果 actual_data_path 为空或不存在，优先尝试项目默认 data 目录
+        # 如果 actual_data_path 为空或不存在，优先尝试 mas_2/data 与 ./data（不依赖 Notebook CWD）
         if not actual_data_path or not os.path.exists(actual_data_path):
-            default_data_dir = os.path.abspath("./data")
-            if os.path.exists(default_data_dir):
-                actual_data_path = default_data_dir
-                print(f"  --> 数据路径无效，使用默认 data 目录: {actual_data_path}")
+            for default_data_dir in _mas2_data_dir_candidates():
+                if default_data_dir and os.path.isdir(default_data_dir):
+                    actual_data_path = default_data_dir
+                    print(f"  --> 数据路径无效，使用默认 data 目录: {actual_data_path}")
+                    break
 
         # 如果仍无有效数据路径，再回退到 result_path
         if not actual_data_path or not os.path.exists(actual_data_path):
@@ -603,17 +765,25 @@ except Exception as e:
 
         # 在 Docker 容器中执行代码
         # 传递 input_files 以便 executor 智能确定需要挂载的目录
+        wf_sid = state.get("current_step_skill_id")
+        workflow_host = None
+        if should_mount_workflow_in_docker(wf_sid):
+            workflow_host = resolve_workflow_root(wf_sid)
+            if workflow_host:
+                print(f"  --> Workflow 目录将挂载到容器 /app/workflow: {workflow_host}")
+
         executor = CodeExecutor(
             docker_path=temp_dir,
             data_dir=actual_data_path if actual_data_path and os.path.exists(actual_data_path) else None,
             input_files=input_files if input_files else None,
-            output_dir=result_path
+            output_dir=result_path,
+            workflow_host_path=workflow_host,
         )
 
         try:
             result = executor.execute(timeout=600)  # 10分钟超时
 
-            # 打印执行日志（控制台仅预览，完整内容写入 pending_contribution["output"]）
+            # 打印执行日志（控制台预览；完整 stdout 默认不入 state，见 MAS_KEEP_FULL_EXEC_OUTPUT_IN_STATE / MAS_SAVE_FULL_EXEC_LOG）
             output_str = result.get('output', '')
             _log_preview = output_str if len(output_str) <= 2000 else output_str[:2000] + "\n... (共 {} 字符，完整内容见界面)".format(len(output_str))
             print(f"【Docker代码执行日志】\n{_log_preview}")
@@ -637,17 +807,15 @@ except Exception as e:
                 state["success"] = True  # 标记为成功
                 print("  --> 代码执行成功！已提取分析结果")
 
-                # 更新 pending_contribution（含完整容器标准输出，便于前端展示）
-                state["pending_contribution"] = {
-                    "code": code,
-                    "requirements": requirements,
-                    "task": state.get("task", ""),
-                    "result": state["analysis_result"],
-                    "success": True,
-                    "output_files": result.get('files', []),
-                    "output": output_str,
-                    "output_display": summarize_docker_stdout(output_str),
-                }
+                state["pending_contribution"] = _build_execute_pending_contribution(
+                    code=code,
+                    requirements=requirements,
+                    task=state.get("task", ""),
+                    output_str=output_str,
+                    success=True,
+                    result_value=state["analysis_result"],
+                    output_files=result.get("files", []),
+                )
             else:
                 # 执行失败或没有找到结果标记
                 # 优先使用executor返回的error字段，否则从output中提取错误信息
@@ -699,16 +867,14 @@ except Exception as e:
                 _fail_preview = error_msg if len(error_msg) <= 500 else error_msg[:500] + "..."
                 print(f"  --> 代码执行失败: {_fail_preview}")
 
-                # 更新 pending_contribution（完整 stdout，便于前端与 Critic 排查）
-                state["pending_contribution"] = {
-                    "code": code,
-                    "requirements": requirements,
-                    "task": state.get("task", ""),
-                    "error": error_msg,
-                    "success": False,
-                    "output": output_str or "",
-                    "output_display": summarize_docker_stdout(output_str or ""),
-                }
+                state["pending_contribution"] = _build_execute_pending_contribution(
+                    code=code,
+                    requirements=requirements,
+                    task=state.get("task", ""),
+                    output_str=output_str or "",
+                    success=False,
+                    error_msg=error_msg,
+                )
 
         except Exception as e:
             # 处理其他运行时错误（参考 umap_langgraph.py 的改进）
@@ -719,15 +885,14 @@ except Exception as e:
             state["success"] = False
             print(f"  --> {error_msg}")
 
-            state["pending_contribution"] = {
-                "code": code,
-                "requirements": requirements,
-                "task": state.get("task", ""),
-                "error": error_msg,
-                "success": False,
-                "output": _exec_log,
-                "output_display": summarize_docker_stdout(_exec_log or ""),
-            }
+            state["pending_contribution"] = _build_execute_pending_contribution(
+                code=code,
+                requirements=requirements,
+                task=state.get("task", ""),
+                output_str=_exec_log or "",
+                success=False,
+                error_msg=error_msg,
+            )
 
     return state
 
@@ -791,6 +956,7 @@ def display_result(state: CodeAgentState) -> CodeAgentState:
         print(f"调试信息：")
         print(f"提取的analysis_result原始值：{state.get('analysis_result', '空')[:100]}")
         # print(f"提取的umap_base64原始值：{state.get('umap_base64', '空')[:50]}")
+    state["last_worker"] = "code_dev"
     return state
 
 

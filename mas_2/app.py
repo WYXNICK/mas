@@ -44,6 +44,7 @@ def build_initial_state(user_query: str) -> dict:
         "current_step_input": None,
         "current_step_expected_output": None,
         "current_step_file_paths": None,
+        "current_step_skill_id": None,
         "next_worker": "rag_researcher",
         "last_worker": "",
         "final_report": "",
@@ -59,6 +60,40 @@ def build_initial_state(user_query: str) -> dict:
 _MAIN_GRAPH_NODES = frozenset(
     {"supervisor", "rag_researcher", "code_dev", "tool_caller", "critic", "finalize"}
 )
+
+# Code Dev 子图内部节点（astream_events 上报时用于侧栏提示与子 Step）
+_CODE_DEV_INNER_NODES = frozenset(
+    {"generate_code", "self_reflection", "execute_code", "prepare_retry", "display_result"}
+)
+_CODE_DEV_INNER_PROGRESS = {
+    "generate_code": "Code Dev · 正在生成代码…",
+    "self_reflection": "Code Dev · 自我检查…",
+    "execute_code": "Code Dev · 正在 Docker 中执行…",
+    "prepare_retry": "Code Dev · 准备重试…",
+    "display_result": "Code Dev · 正在整理展示…",
+}
+_CODE_DEV_INNER_DONE = {
+    "generate_code": "Code Dev · 代码已生成",
+    "self_reflection": "Code Dev · 自检完成",
+    "execute_code": "Code Dev · 执行阶段结束",
+    "prepare_retry": "Code Dev · 重试准备完成",
+    "display_result": "Code Dev · 展示完成",
+}
+
+
+def _code_dev_inner_from_event(event: dict) -> str | None:
+    name = event.get("name")
+    if isinstance(name, str) and name in _CODE_DEV_INNER_NODES:
+        return name
+    meta = event.get("metadata") or {}
+    lg_node = meta.get("langgraph_node")
+    if isinstance(lg_node, str) and lg_node in _CODE_DEV_INNER_NODES:
+        return lg_node
+    ns = str(meta.get("langgraph_checkpoint_ns") or "")
+    for n in sorted(_CODE_DEV_INNER_NODES, key=len, reverse=True):
+        if n in ns:
+            return n
+    return None
 
 
 def _run_graph_stream(initial_state: dict, config: dict) -> tuple[list[tuple[str, dict]], dict | None]:
@@ -208,14 +243,25 @@ def _format_agent_output(node_name: str, state: dict) -> str:
             if pending.get("error"):
                 parts.append("**错误**\n" + str(pending["error"]))
 
-            raw_out = pending.get("output") or ""
+            raw_out = (pending.get("output") or "").strip()
+            tail_out = (pending.get("output_tail") or "").strip()
             disp = (pending.get("output_display") or "").strip()
             if not disp and raw_out:
                 disp = summarize_docker_stdout(str(raw_out))
+            if not disp and tail_out:
+                disp = summarize_docker_stdout(str(tail_out))
             if disp:
                 parts.append("**压缩执行日志**\n```\n" + disp + "\n```")
+            log_disk = (pending.get("output_log_path") or "").strip()
+            if log_disk:
+                parts.append(f"**完整执行日志文件**（服务端）：`{log_disk}`")
 
-            if _env_flag("MAS_SAVE_FULL_EXEC_LOG") and raw_out:
+            # 子图 execute 节点已落盘时带 output_log_path；此处仅作兼容旧 state（仍含 output）的补写
+            if (
+                _env_flag("MAS_SAVE_FULL_EXEC_LOG")
+                and raw_out
+                and not (pending.get("output_log_path") or "").strip()
+            ):
                 results_dir = _APP_DIR / "results"
                 try:
                     results_dir.mkdir(parents=True, exist_ok=True)
@@ -226,8 +272,16 @@ def _format_agent_output(node_name: str, state: dict) -> str:
                 except OSError:
                     pass
 
-            if _env_flag("MAS_CHAINLIT_SHOW_FULL_EXEC_LOG") and raw_out:
-                parts.append("**完整执行日志**\n```\n" + str(raw_out).strip() + "\n```")
+            if _env_flag("MAS_CHAINLIT_SHOW_FULL_EXEC_LOG"):
+                if raw_out:
+                    parts.append("**完整执行日志**\n```\n" + str(raw_out).strip() + "\n```")
+                elif tail_out:
+                    parts.append(
+                        "**完整执行日志**（默认未保留整段 stdout；以下为尾部）\n```\n"
+                        + str(tail_out).strip()
+                        + "\n```\n"
+                        "可设置 `MAS_KEEP_FULL_EXEC_OUTPUT_IN_STATE=1` 或在 state 中查看 `output_log_path`。"
+                    )
 
             # 生成/保存的文件列表（保留结构，后续可扩展为图片/表格等可视化）
             output_files = pending.get("output_files") or []
@@ -292,6 +346,248 @@ NODE_DISPLAY_NAMES = {
     "finalize": "Finalize（汇总）",
 }
 
+# 侧栏固定拓扑顺序（与 UI 布局一致）
+_MAIN_GRAPH_AGENT_ORDER: tuple[str, ...] = (
+    "supervisor",
+    "rag_researcher",
+    "code_dev",
+    "tool_caller",
+    "critic",
+    "finalize",
+)
+
+_SNAPSHOT_TEXT_MAX = 800
+_SNAPSHOT_CODE_PREVIEW_MAX = 480
+
+
+def _truncate_text(s: str, max_len: int = _SNAPSHOT_TEXT_MAX) -> str:
+    t = (s or "").strip()
+    if len(t) <= max_len:
+        return t
+    return t[: max_len - 1] + "…"
+
+
+def _snapshot_for_agent(node_id: str, state: dict) -> dict:
+    """从 GlobalState 抽取单节点可读快照（可 JSON 序列化），供侧栏 CustomElement 展示。"""
+    title = NODE_DISPLAY_NAMES.get(node_id, node_id)
+    lines: list[str] = []
+
+    if node_id == "supervisor":
+        plan = state.get("plan") or []
+        lines.append(f"计划步骤数：{len(plan)}")
+        lines.append(f"current_step_index：{state.get('current_step_index', 0)}")
+        nw = state.get("next_worker") or ""
+        if nw:
+            lines.append(f"next_worker：{nw}")
+        if plan:
+            p0 = plan[0]
+            if isinstance(p0, dict):
+                nm, sk = p0.get("name", ""), p0.get("skill_id") or "—"
+            else:
+                nm, sk = getattr(p0, "name", ""), getattr(p0, "skill_id", None) or "—"
+            lines.append(f"首步：{nm}（skill：{sk}）")
+
+    elif node_id == "rag_researcher":
+        rag = state.get("rag_context", "")
+        if rag:
+            lines.append(f"rag_context（摘要）：{_truncate_text(str(rag), 600)}")
+        else:
+            lines.append("尚无 rag_context")
+
+    elif node_id == "code_dev":
+        pending = state.get("pending_contribution")
+        if isinstance(pending, dict):
+            code = pending.get("code")
+            if code:
+                lines.append(
+                    f"代码预览：{_truncate_text(str(code), _SNAPSHOT_CODE_PREVIEW_MAX)}"
+                )
+            err = pending.get("error")
+            if err:
+                lines.append(f"错误：{_truncate_text(str(err), 400)}")
+            res = pending.get("result")
+            if res:
+                lines.append(f"结果摘要：{_truncate_text(str(res), 500)}")
+            if pending.get("output_files"):
+                lines.append(f"输出文件数：{len(pending['output_files'])}")
+        elif pending is not None:
+            lines.append(_truncate_text(str(pending), 500))
+        cs = state.get("code_solution")
+        if isinstance(cs, dict) and cs.get("code") and not any("代码预览" in x for x in lines):
+            lines.append(
+                f"code_solution 预览：{_truncate_text(str(cs.get('code')), _SNAPSHOT_CODE_PREVIEW_MAX)}"
+            )
+
+    elif node_id == "tool_caller":
+        report = state.get("final_report", "")
+        if report:
+            lines.append(_truncate_text(str(report), 650))
+        pending = state.get("pending_contribution")
+        if pending and isinstance(pending, str):
+            lines.append(_truncate_text(pending, 400))
+
+    elif node_id == "critic":
+        lines.append("审核结果：" + ("通过" if state.get("is_approved") else "驳回"))
+        fb = state.get("critique_feedback") or ""
+        if fb:
+            lines.append(f"反馈：{_truncate_text(str(fb), 650)}")
+
+    elif node_id == "finalize":
+        ans = state.get("final_answer", "")
+        if ans:
+            lines.append(f"final_answer：{_truncate_text(str(ans), 720)}")
+        else:
+            lines.append("尚无 final_answer")
+
+    if not lines:
+        lines.append("（本轮无摘要产出）")
+
+    return {"title": title, "lines": lines}
+
+
+def _format_visited_path(visited: list[str]) -> str:
+    if not visited:
+        return "（尚无）"
+    return " → ".join(NODE_DISPLAY_NAMES.get(n, n) for n in visited)
+
+
+def _default_main_graph_sidebar_props() -> dict:
+    """会话初始 / 无快照时「打开主图」按钮使用的占位内容。"""
+    return {
+        "agentOrder": list(_MAIN_GRAPH_AGENT_ORDER),
+        "activeId": None,
+        "visitedSequence": [],
+        "snapshots": {},
+        "statusLine": "尚未开始任务。发送一条消息后，此处会显示当前执行节点。",
+        "pathLine": f"已完成路径：{_format_visited_path([])}",
+        "note": "",
+    }
+
+
+def build_graph_sidebar_props(
+    *,
+    current_node: str | None,
+    visited: list[str],
+    astream_mode: bool,
+    snapshots: dict[str, dict],
+    note: str | None = None,
+) -> dict:
+    """侧栏 CustomElement MainGraphFlow：固定拓扑 + 高亮 + 各 Agent 快照。"""
+    if astream_mode:
+        if current_node:
+            cur = NODE_DISPLAY_NAMES.get(current_node, current_node)
+            status = f"当前执行：{cur}"
+        else:
+            status = "当前执行：（节点间隙 / 等待下一节点）"
+    else:
+        last = visited[-1] if visited else None
+        last_d = NODE_DISPLAY_NAMES.get(last, last) if last else "—"
+        status = (
+            "说明：astream_events 不可用，仅在节点完成后更新。\n"
+            f"最近完成：{last_d}"
+        )
+
+    return {
+        "agentOrder": list(_MAIN_GRAPH_AGENT_ORDER),
+        "activeId": current_node,
+        "visitedSequence": list(visited),
+        "snapshots": snapshots,
+        "statusLine": status,
+        "pathLine": f"已完成路径：{_format_visited_path(visited)}",
+        "note": (note or "").strip(),
+    }
+
+
+class GraphSidebarController:
+    """Chainlit ElementSidebar：固定主图卡片 + 当前 Agent + 各节点状态快照。"""
+
+    __slots__ = (
+        "astream_mode",
+        "current_node",
+        "visited",
+        "snapshots",
+        "code_dev_inner_line",
+        "_push_seq",
+    )
+
+    def __init__(self, *, astream_mode: bool) -> None:
+        self.astream_mode = astream_mode
+        self.current_node: str | None = None
+        self.visited: list[str] = []
+        self.snapshots: dict[str, dict] = {}
+        self.code_dev_inner_line: str | None = None
+        # Chainlit：set_elements 在「与上次相同的 key」下不会替换内容，导致主图不随执行更新
+        self._push_seq = 0
+
+    def mark_start(self, name: str) -> None:
+        if name in _MAIN_GRAPH_NODES:
+            self.current_node = name
+
+    def mark_end(self, name: str) -> None:
+        if name in _MAIN_GRAPH_NODES:
+            self.visited.append(name)
+            self.current_node = None
+
+    def mark_completed_only(self, name: str) -> None:
+        if name in _MAIN_GRAPH_NODES:
+            self.visited.append(name)
+
+    def merge_snapshot(self, node_id: str, state: dict) -> None:
+        if node_id not in _MAIN_GRAPH_NODES:
+            return
+        self.snapshots[node_id] = _snapshot_for_agent(node_id, state)
+        if node_id == "code_dev":
+            self.code_dev_inner_line = None
+
+    def set_code_dev_inner_line(self, line: str | None) -> None:
+        self.code_dev_inner_line = (line or "").strip() or None
+
+    def _snapshots_for_props(self) -> dict[str, dict]:
+        out: dict[str, dict] = {k: dict(v) for k, v in self.snapshots.items()}
+        if self.code_dev_inner_line:
+            base = out.get("code_dev") or {
+                "title": NODE_DISPLAY_NAMES["code_dev"],
+                "lines": ["Code Dev 主节点运行中…"],
+            }
+            merged = dict(base)
+            merged["innerLine"] = self.code_dev_inner_line
+            out["code_dev"] = merged
+        return out
+
+    async def push(self, *, note: str | None = None) -> None:
+        props = build_graph_sidebar_props(
+            current_node=self.current_node,
+            visited=list(self.visited),
+            astream_mode=self.astream_mode,
+            snapshots=self._snapshots_for_props(),
+            note=note,
+        )
+        cl.user_session.set("main_graph_sidebar_props", props)
+        self._push_seq += 1
+        await cl.ElementSidebar.set_title("主图执行状态")
+        await cl.ElementSidebar.set_elements(
+            [cl.CustomElement(name="MainGraphFlow", props=props)],
+            key=f"main_graph_exec_{self._push_seq}",
+        )
+
+    async def show_placeholder(self) -> None:
+        await self.push(note="状态：工作流已启动，等待图事件…")
+
+    async def set_idle_title(self) -> None:
+        """任务结束后更新标题；保留最后一次 push 的图与路径，便于对照聊天 Steps。"""
+        await cl.ElementSidebar.set_title("主图 — 就绪")
+
+
+@cl.action_callback("show_main_graph_sidebar")
+async def on_show_main_graph_sidebar(action: cl.Action) -> None:
+    """聊天消息中的「打开主图」按钮：用最近一次侧栏快照重新打开 ElementSidebar。"""
+    props = cl.user_session.get("main_graph_sidebar_props") or _default_main_graph_sidebar_props()
+    await cl.ElementSidebar.set_title("主图执行状态")
+    await cl.ElementSidebar.set_elements(
+        [cl.CustomElement(name="MainGraphFlow", props=props)],
+        key=f"main_graph_reopen_{uuid.uuid4().hex}",
+    )
+
 
 async def _emit_agent_step(node_name: str, state: dict) -> None:
     """将单个 agent 节点的可读输出发到 Chainlit（一个 Step）。"""
@@ -308,7 +604,42 @@ async def _emit_agent_step(node_name: str, state: dict) -> None:
         step.output = text
 
 
-async def _run_graph_incremental_queue(graph, initial_state: dict, config_dict: dict) -> tuple[dict | None, bool]:
+async def _emit_code_dev_inner_step(inner_name: str, state: dict | None) -> None:
+    """Code Dev 子图单节点完成时发一条轻量子 Step（不替代顶层 Code Dev Step）。"""
+    title = _CODE_DEV_INNER_DONE.get(inner_name, inner_name)
+    body = f"**{title}**"
+    if inner_name == "execute_code" and isinstance(state, dict) and "success" in state:
+        body += f"\n本轮 success 字段：`{state.get('success')}`"
+    async with cl.Step(name=f"Code Dev / {inner_name}", type="tool") as step:
+        step.output = body
+
+
+async def _drain_code_dev_log_queue(log_q: queue.Queue, graph_done: asyncio.Event) -> None:
+    """从 executor 线程 put 的队列读出 Docker 日志块，流式发到 Chainlit。"""
+    msg = cl.Message(content="**Docker 执行日志**（实时）\n\n")
+    await msg.send()
+    idle_after_done = 0
+    while True:
+        try:
+            chunk = log_q.get_nowait()
+            idle_after_done = 0
+            await msg.stream_token(chunk)
+            continue
+        except queue.Empty:
+            pass
+        if graph_done.is_set():
+            idle_after_done += 1
+            if idle_after_done > 20:
+                break
+        await asyncio.sleep(0.04)
+
+
+async def _run_graph_incremental_queue(
+    graph,
+    initial_state: dict,
+    config_dict: dict,
+    sidebar: GraphSidebarController | None = None,
+) -> tuple[dict | None, bool]:
     """
     同步 graph.stream 放在后台线程，每完成一个顶层节点即通过队列交给主协程发 Step。
     不流式输出 LLM token，但不必等整条图跑完才看到各节点结果。
@@ -335,13 +666,22 @@ async def _run_graph_incremental_queue(graph, initial_state: dict, config_dict: 
             break
         node_name, state = item
         final_state = state
+        if sidebar is not None:
+            sidebar.mark_completed_only(node_name)
+            sidebar.merge_snapshot(node_name, state)
+            await sidebar.push()
         await _emit_agent_step(node_name, state)
     if err_holder:
         raise err_holder[0]
     return final_state, False
 
 
-async def _run_graph_astream_events(graph, initial_state: dict, config_dict: dict) -> tuple[dict | None, bool]:
+async def _run_graph_astream_events(
+    graph,
+    initial_state: dict,
+    config_dict: dict,
+    sidebar: GraphSidebarController | None = None,
+) -> tuple[dict | None, bool]:
     """
     使用 LangGraph astream_events：顶层节点完成即展示 Step；finalize 内 LLM 的 token 流式到一条 Message。
     若当前环境事件结构不兼容，请回退到 _run_graph_incremental_queue。
@@ -356,7 +696,35 @@ async def _run_graph_astream_events(graph, initial_state: dict, config_dict: dic
         version="v2",
     ):
         ev = event.get("event")
-        if ev == "on_chain_end":
+        if ev == "on_chain_start":
+            inner = _code_dev_inner_from_event(event)
+            if inner:
+                if sidebar is not None:
+                    sidebar.set_code_dev_inner_line(
+                        _CODE_DEV_INNER_PROGRESS.get(inner, inner)
+                    )
+                    await sidebar.push()
+                continue
+            name = event.get("name")
+            if name not in _MAIN_GRAPH_NODES:
+                continue
+            if sidebar is not None:
+                sidebar.mark_start(name)
+                await sidebar.push()
+        elif ev == "on_chain_end":
+            inner = _code_dev_inner_from_event(event)
+            if inner:
+                data = event.get("data")
+                out = data.get("output") if isinstance(data, dict) else None
+                await _emit_code_dev_inner_step(
+                    inner, out if isinstance(out, dict) else None
+                )
+                if sidebar is not None:
+                    sidebar.set_code_dev_inner_line(
+                        _CODE_DEV_INNER_DONE.get(inner, inner)
+                    )
+                    await sidebar.push()
+                continue
             name = event.get("name")
             if name not in _MAIN_GRAPH_NODES:
                 continue
@@ -367,6 +735,10 @@ async def _run_graph_astream_events(graph, initial_state: dict, config_dict: dic
             if not isinstance(out, dict):
                 continue
             final_state = out
+            if sidebar is not None:
+                sidebar.merge_snapshot(name, out)
+                sidebar.mark_end(name)
+                await sidebar.push()
             # finalize 若已做 token 流式，避免 Step 再贴一整段重复的最终答案
             if name == "finalize" and streamed_finalize_tokens:
                 continue
@@ -391,8 +763,15 @@ async def _run_graph_astream_events(graph, initial_state: dict, config_dict: dic
 
 @cl.on_chat_start
 async def on_chat_start():
+    cl.user_session.set("main_graph_sidebar_props", _default_main_graph_sidebar_props())
     await cl.Message(
-        content="请输入您的任务描述，多智能体系统将进行规划、检索、代码生成/执行与审核，并在完成后展示最终答案。"
+        content=(
+            "请输入您的任务描述，多智能体系统将进行规划、检索、代码生成/执行与审核，并在完成后展示最终答案。\n\n"
+            "点击下方 **打开主图** 可在侧栏查看固定主图、运行高亮与各 Agent 状态摘要（执行过程中会自动刷新）。"
+        ),
+        actions=[
+            cl.Action(name="show_main_graph_sidebar", label="打开主图", payload={}),
+        ],
     ).send()
 
 
@@ -406,8 +785,25 @@ async def on_message(message: cl.Message):
     initial_state = build_initial_state(user_query)
     session_id = getattr(cl.context.session, "id", None) or "default"
     # 不使用 LangchainCallbackHandler，避免中间步骤以原始 JSON 展示；改为下面按节点解析后展示
+    configurable: dict = {"thread_id": session_id}
+    graph_done = asyncio.Event()
+    log_q: queue.Queue | None = None
+    log_pump_task: asyncio.Task | None = None
+    if _env_flag("MAS_CHAINLIT_STREAM_DOCKER_LOG"):
+        log_q = queue.Queue()
+        configurable["code_dev_log_queue"] = log_q
+
+        async def _log_pump_runner() -> None:
+            try:
+                if log_q is not None:
+                    await _drain_code_dev_log_queue(log_q, graph_done)
+            except Exception as ex:
+                print(f"[chainlit] Docker 日志流: {ex!s}")
+
+        log_pump_task = asyncio.create_task(_log_pump_runner())
+
     config_dict = {
-        "configurable": {"thread_id": session_id},
+        "configurable": configurable,
         "recursion_limit": 20,
     }
 
@@ -418,24 +814,53 @@ async def on_message(message: cl.Message):
 
     final_state = None
     streamed_finalize = False
+    sidebar: GraphSidebarController | None = None
     try:
         if hasattr(graph, "astream_events"):
+            sidebar = GraphSidebarController(astream_mode=True)
             try:
+                await sidebar.show_placeholder()
                 final_state, streamed_finalize = await _run_graph_astream_events(
-                    graph, initial_state, config_dict
+                    graph, initial_state, config_dict, sidebar=sidebar
                 )
             except Exception as e:
                 print(f"[chainlit] astream_events 不可用或失败，回退为按节点增量展示: {e!s}")
+                sidebar = GraphSidebarController(astream_mode=False)
+                await sidebar.show_placeholder()
                 final_state, streamed_finalize = await _run_graph_incremental_queue(
-                    graph, initial_state, config_dict
+                    graph, initial_state, config_dict, sidebar=sidebar
                 )
         else:
+            sidebar = GraphSidebarController(astream_mode=False)
+            await sidebar.show_placeholder()
             final_state, streamed_finalize = await _run_graph_incremental_queue(
-                graph, initial_state, config_dict
+                graph, initial_state, config_dict, sidebar=sidebar
             )
     except Exception as e:
+        if sidebar is not None:
+            sidebar.current_node = None
+            try:
+                await sidebar.push(note=f"**执行出错**：`{e!s}`")
+            except Exception:
+                pass
         await cl.Message(content=f"执行出错: {e!s}").send()
         return
+    finally:
+        graph_done.set()
+        if log_pump_task is not None:
+            try:
+                await asyncio.sleep(0.3)
+                log_pump_task.cancel()
+                await log_pump_task
+            except asyncio.CancelledError:
+                pass
+            except Exception:
+                pass
+        if sidebar is not None:
+            try:
+                await sidebar.set_idle_title()
+            except Exception:
+                pass
 
     if not final_state:
         await cl.Message(
